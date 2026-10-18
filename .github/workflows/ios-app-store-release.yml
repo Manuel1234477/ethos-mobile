@@ -51,6 +51,9 @@ on:
 
 permissions:
   contents: read
+  # Build provenance attestations (#586).
+  id-token: write
+  attestations: write
 
 # One release at a time; a second tag waits instead of racing for build numbers.
 concurrency:
@@ -194,6 +197,83 @@ jobs:
           MATCH_GIT_BASIC_AUTHORIZATION: ${{ secrets.MATCH_GIT_BASIC_AUTHORIZATION }}
           ETHOS_CERT_PINS: ${{ secrets.ETHOS_CERT_PINS }}
         run: bundle exec fastlane ios beta dry_run:"$DRY_RUN"
+
+      # CycloneDX SBOM for the SwiftPM dependency graph (#585).
+      - name: Generate SwiftPM CycloneDX SBOM
+        if: steps.options.outputs.dry_run != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p sbom
+          # Resolve the package graph and convert it to CycloneDX JSON.
+          swift package show-dependencies --format json > sbom/swiftpm-dependencies.json
+          python3 - <<'PY'
+          import json
+          import os
+          import uuid
+
+          with open("sbom/swiftpm-dependencies.json", encoding="utf-8") as fh:
+              graph = json.load(fh)
+
+          components = []
+
+          def walk(node):
+              for dep in node.get("dependencies", []):
+                  version = dep.get("version") or "unknown"
+                  components.append({
+                      "type": "library",
+                      "name": dep.get("name") or dep.get("identity") or "unknown",
+                      "version": version,
+                      "purl": f"pkg:swift/{dep.get('identity') or dep.get('name')}@{version}",
+                  })
+                  walk(dep)
+
+          walk(graph)
+
+          sbom = {
+              "bomFormat": "CycloneDX",
+              "specVersion": "1.5",
+              "serialNumber": f"urn:uuid:{uuid.uuid4()}",
+              "version": 1,
+              "metadata": {
+                  "component": {
+                      "type": "application",
+                      "name": "EthosProtocol-iOS",
+                      "version": os.environ.get("RELEASE_TAG") or "dev",
+                  },
+              },
+              "components": components,
+          }
+
+          with open("sbom/swiftpm-cyclonedx.json", "w", encoding="utf-8") as fh:
+              json.dump(sbom, fh, indent=2)
+          PY
+          rm -f sbom/swiftpm-dependencies.json
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+
+      - name: Upload SwiftPM SBOM artifact
+        if: steps.options.outputs.dry_run != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: swiftpm-sbom
+          path: ios/EthosProtocol/sbom/swiftpm-cyclonedx.json
+          if-no-files-found: error
+
+      - name: Attach SwiftPM SBOM to GitHub release
+        if: steps.options.outputs.dry_run != 'true' && github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release upload "$RELEASE_TAG" sbom/swiftpm-cyclonedx.json --clobber
+
+      # Build provenance attestation for the built archive/IPA (#586).
+      - name: Attest build provenance
+        if: steps.options.outputs.dry_run != 'true'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            build/*.ipa
+            build/*.xcarchive
 
       # A dry run also walks the App Store lane, so unanswered review questions
       # or bad metadata/screenshots show up before anyone asks for approval.

@@ -48,6 +48,9 @@ on:
 
 permissions:
   contents: read
+  # Required by actions/attest-build-provenance (#586).
+  id-token: write
+  attestations: write
 
 # One distribution run at a time; a second push waits instead of racing.
 concurrency:
@@ -176,6 +179,27 @@ jobs:
       - name: Remove upload keystore
         if: always()
         run: rm -f "$RUNNER_TEMP/upload-keystore.jks"
+
+      # CycloneDX SBOM for the Gradle dependency graph of the distributed APK (#585).
+      - name: Generate CycloneDX SBOM
+        if: steps.options.outputs.dry_run != 'true'
+        run: ./gradlew cyclonedxReleaseRuntimeClasspath -Pcyclonedx.outputName=sbom-android-firebase
+
+      - name: Upload SBOM artifact
+        if: steps.options.outputs.dry_run != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-android-firebase-${{ github.sha }}
+          path: android/build/reports/cyclonedx/*.json
+          if-no-files-found: error
+          retention-days: 90
+
+      # Build provenance attestation for the distributed APK (#586).
+      - name: Attest APK build provenance
+        if: steps.options.outputs.dry_run != 'true'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: android/build/fastlane/firebase_beta/*.apk
 
       # Upload the APK as a workflow artifact so it can be inspected if
       # the Firebase upload fails or for manual sideloading in emergencies.

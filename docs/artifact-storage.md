@@ -8,6 +8,7 @@ and how they are retained and cleaned up.
 - [Workflow](#workflow)
 - [S3 bucket structure](#s3-bucket-structure)
 - [Versioning scheme](#versioning-scheme)
+- [Signing and verification](#signing-and-verification)
 - [Retention policies](#retention-policies)
 - [Setup and required secrets](#setup-and-required-secrets)
 - [Downloading an artifact](#downloading-an-artifact)
@@ -48,12 +49,15 @@ The workflow has three jobs:
 
 1. **`version`** — computes the version label and S3 key prefixes.
 2. **`ios-archive`** — builds the iOS `.ipa` via fastlane `ios archive`, computes
-   a SHA-256 checksum, writes a `metadata.json` manifest, and uploads to S3.
+   a SHA-256 checksum, writes a `metadata.json` manifest and a `SHA256SUMS`
+   manifest, signs the manifest with cosign, and uploads everything to S3.
 3. **`android-archive`** — assembles the release AAB and APK via Gradle, computes
-   checksums, writes `metadata.json`, and uploads to S3 (including the R8 mapping
-   file).
+   checksums, writes `metadata.json` and `SHA256SUMS`, signs the manifest with
+   cosign, and uploads to S3 (including the R8 mapping file).
 4. **`apply-retention-policy`** — runs `scripts/manage_artifact_retention.py` to
-   keep the S3 lifecycle rules authoritative after every release.
+   keep the S3 lifecycle rules authoritative after every release, and tags
+   objects belonging to currently deployed versions so they are exempt from
+   expiry.
 
 ---
 
@@ -66,6 +70,9 @@ s3://<ARTIFACT_BUCKET>/
       v1.4.0/
         EthosProtocol-v1.4.0.ipa
         EthosProtocol-v1.4.0.ipa.sha256
+        SHA256SUMS
+        SHA256SUMS.sig
+        SHA256SUMS.pem
         metadata.json
       v1.3.0/
         ...
@@ -74,6 +81,9 @@ s3://<ARTIFACT_BUCKET>/
         20261005-abc1234/
           EthosProtocol-main-20261005-abc1234.ipa
           EthosProtocol-main-20261005-abc1234.ipa.sha256
+          SHA256SUMS
+          SHA256SUMS.sig
+          SHA256SUMS.pem
           metadata.json
   android/
     releases/
@@ -82,6 +92,9 @@ s3://<ARTIFACT_BUCKET>/
         app-release-v1.4.0.aab.sha256
         app-release-v1.4.0.apk
         app-release-v1.4.0.apk.sha256
+        SHA256SUMS
+        SHA256SUMS.sig
+        SHA256SUMS.pem
         metadata.json
       v1.3.0/
         ...
@@ -120,6 +133,59 @@ Each directory also contains a `metadata.json` with:
 
 ---
 
+## Signing and verification
+
+Every release directory contains a `SHA256SUMS` manifest listing the SHA-256
+digest of each artifact in that directory:
+
+```
+abc123...  EthosProtocol-v1.4.0.ipa
+def456...  metadata.json
+```
+
+### How manifests are generated and signed
+
+During upload the workflow:
+
+1. Computes `sha256sum` for every artifact in the version directory and writes
+   the results to `SHA256SUMS`.
+2. Signs the manifest with [cosign](https://docs.sigstore.dev/cosign/overview/)
+   keyless signing (Sigstore/Fulcio), producing:
+   - `SHA256SUMS.sig` — the detached signature.
+   - `SHA256SUMS.pem` — the signing certificate (contains the OIDC identity and
+     the Rekor transparency-log entry).
+3. Uploads `SHA256SUMS`, `SHA256SUMS.sig`, and `SHA256SUMS.pem` alongside the
+   artifacts.
+
+Because the signature is bound to the workflow identity, an object overwritten
+in the bucket (or a manifest swapped out) fails verification.
+
+### Verifying a downloaded artifact
+
+```bash
+# 1. Download the artifacts and the manifest files
+aws s3 cp --recursive \
+  s3://ethos-protocol-artifacts/ios/releases/v1.4.0/ ./v1.4.0/
+
+cd v1.4.0
+
+# 2. Verify the manifest signature (fails if the manifest was tampered with)
+cosign verify-blob \
+  --signature SHA256SUMS.sig \
+  --certificate SHA256SUMS.pem \
+  --certificate-identity-regexp 'https://github.com/ethos-protocol/ethos-mobile/.github/workflows/artifact-storage.yml@refs/tags/v.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS
+
+# 3. Verify every artifact against the signed manifest
+sha256sum -c SHA256SUMS
+```
+
+On macOS use `shasum -a 256 -c SHA256SUMS` instead of `sha256sum -c`. Both
+steps must pass before installing or distributing the artifact.
+
+---
+
 ## Versioning scheme
 
 | Build type | Version label | S3 key pattern |
@@ -141,17 +207,53 @@ Managed by `scripts/manage_artifact_retention.py` and applied to the bucket via
 
 | Prefix | Default retention | Override variable |
 |--------|-------------------|-------------------|
-| `ios/releases/` | 180 days | `ARTIFACT_RELEASE_RETENTION_DAYS` |
-| `android/releases/` | 180 days | `ARTIFACT_RELEASE_RETENTION_DAYS` |
-| `r8-mappings/` | 180 days | `ARTIFACT_RELEASE_RETENTION_DAYS` |
+| `ios/releases/` | 180 days (unless tagged as deployed) | `ARTIFACT_RELEASE_RETENTION_DAYS` |
+| `android/releases/` | 180 days (unless tagged as deployed) | `ARTIFACT_RELEASE_RETENTION_DAYS` |
+| `r8-mappings/` | 180 days (unless tagged as deployed or referenced by a live crash report) | `ARTIFACT_RELEASE_RETENTION_DAYS` |
 | `ios/snapshots/` | 30 days | `ARTIFACT_SNAPSHOT_RETENTION_DAYS` |
 | `android/snapshots/` | 30 days | `ARTIFACT_SNAPSHOT_RETENTION_DAYS` |
 | `r8-mappings/snapshots/` | 30 days | `ARTIFACT_SNAPSHOT_RETENTION_DAYS` |
 
-> **Note:** R8 mapping files are retained for the same duration as the release
-> artifacts they correspond to. Crash reports from a production release can
+### Exemption for deployed versions
+
+S3 lifecycle expiry counts from object creation, so a release that is still
+deployed after the retention window would otherwise lose its binary and its R8
+mapping. To prevent this, the retention script tags objects belonging to
+currently deployed versions:
+
+| Tag | Meaning |
+|-----|---------|
+| `deployed=true` | The version is currently live in production (App Store / Play Store) |
+| `crash-report-referenced=true` | The R8 mapping is still needed to de-obfuscate live crash reports |
+
+The lifecycle rules use a tag filter so that objects carrying `deployed=true`
+or `crash-report-referenced=true` are **exempt from expiry**. The tags are
+refreshed on every release run and whenever a version is rolled back or
+promoted.
+
+> **Note:** R8 mapping files are retained for every version that has a live
+> crash report, regardless of age. Crash reports from a production release can
 > arrive months after the release date; removing the mapping file would make
 > those reports unreadable.
+
+### Dry-run report
+
+Before applying changes, run the script with `--dry-run` to see which keys
+would expire and which are still referenced:
+
+```bash
+python3 scripts/manage_artifact_retention.py \
+  --bucket ethos-protocol-artifacts \
+  --dry-run
+```
+
+The report lists, for each prefix:
+
+- Keys that would be expired by the current rules.
+- Keys that are exempt because they are tagged `deployed=true` or
+  `crash-report-referenced=true`.
+- Keys that are still referenced by a live crash report and therefore must be
+  retained.
 
 To change the defaults, set the repository variables
 `ARTIFACT_RELEASE_RETENTION_DAYS` and `ARTIFACT_SNAPSHOT_RETENTION_DAYS` in
@@ -235,10 +337,20 @@ aws s3 cp \
   s3://ethos-protocol-artifacts/ios/releases/v1.4.0/EthosProtocol-v1.4.0.ipa \
   EthosProtocol-v1.4.0.ipa
 
-# Verify the checksum
+# Verify the manifest signature and the checksum (see "Signing and verification")
 aws s3 cp \
-  s3://ethos-protocol-artifacts/ios/releases/v1.4.0/EthosProtocol-v1.4.0.ipa.sha256 \
-  - | shasum -a 256 -c
+  s3://ethos-protocol-artifacts/ios/releases/v1.4.0/SHA256SUMS .
+aws s3 cp \
+  s3://ethos-protocol-artifacts/ios/releases/v1.4.0/SHA256SUMS.sig .
+aws s3 cp \
+  s3://ethos-protocol-artifacts/ios/releases/v1.4.0/SHA256SUMS.pem .
+cosign verify-blob \
+  --signature SHA256SUMS.sig \
+  --certificate SHA256SUMS.pem \
+  --certificate-identity-regexp 'https://github.com/ethos-protocol/ethos-mobile/.github/workflows/artifact-storage.yml@refs/tags/v.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS
+shasum -a 256 -c SHA256SUMS
 
 # Download the Android AAB and its R8 mapping
 aws s3 cp \
@@ -259,7 +371,9 @@ Open the workflow run in the GitHub Actions UI and download the artifact named
 
 ## Rolling back to a previous release
 
-1. Download the artifact from S3 as described above and verify its checksum.
+1. Download the artifact from S3 as described above, verify the `SHA256SUMS`
+   signature with `cosign verify-blob`, and verify the checksum with
+   `sha256sum -c SHA256SUMS`.
 2. **iOS** — use Xcode Organizer or `xcrun altool` / Transporter to upload the
    `.ipa` to App Store Connect (the build is already signed):
    ```bash
@@ -273,8 +387,11 @@ Open the workflow run in the GitHub Actions UI and download the artifact named
    verified.
 
 > If the rollback target is more than 180 days old it may have been expired by
-> the lifecycle policy. In that case, rebuild from the corresponding git tag:
-> `git checkout v1.3.0` and trigger the `artifact-storage` workflow manually.
+> the lifecycle policy — unless it is tagged `deployed=true` (see
+> [Retention policies](#retention-policies)). Run the retention script with
+> `--dry-run` to check whether the target is still present. If it has expired,
+> rebuild from the corresponding git tag: `git checkout v1.3.0` and trigger the
+> `artifact-storage` workflow manually.
 
 ---
 
@@ -288,7 +405,9 @@ python3 scripts/manage_artifact_retention.py \
   --bucket ethos-protocol-artifacts \
   --show-current
 
-# Apply default rules (180 / 30 days) — dry run first
+# Apply default rules (180 / 30 days) — dry run first.
+# The dry-run report lists which keys would expire and which are still
+# referenced (tagged deployed=true or crash-report-referenced=true).
 python3 scripts/manage_artifact_retention.py \
   --bucket ethos-protocol-artifacts \
   --dry-run
@@ -332,6 +451,21 @@ following [docs/ios-app-store-release.md](ios-app-store-release.md) and
 This happens when signing credentials are absent (see above). The `.xcarchive.zip`
 contains the compiled app but cannot be installed directly. For a proper `.ipa`
 ensure the signing secrets are configured.
+
+**"cosign verify-blob" fails on a downloaded artifact**
+
+The manifest signature does not match the expected workflow identity, or the
+manifest was modified after signing. Re-download `SHA256SUMS`, `SHA256SUMS.sig`,
+and `SHA256SUMS.pem` from the same version directory and verify again. If the
+signature still fails, do not distribute the artifact — the object may have
+been overwritten in the bucket.
+
+**A release or R8 mapping expired while still in production**
+
+The object was not tagged `deployed=true` (or `crash-report-referenced=true` for
+mappings) before the retention window elapsed. Run
+`scripts/manage_artifact_retention.py --dry-run` to confirm which keys are
+affected, then re-tag the deployed versions and re-apply the lifecycle rules.
 
 **Lifecycle rules not applied after a snapshot push**
 

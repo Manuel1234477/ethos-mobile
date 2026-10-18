@@ -6,6 +6,9 @@ plugins {
     alias(libs.plugins.hilt) apply false
     alias(libs.plugins.ksp) apply false
     alias(libs.plugins.dependency.check)
+    // Generates CycloneDX SBOMs for the Gradle dependency graph (issue #585).
+    // Applied in the app module; declared here so the version is resolved once.
+    id("org.cyclonedx.bom") version "1.9.1" apply false
 }
 
 dependencyCheck {

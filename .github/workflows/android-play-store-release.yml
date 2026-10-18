@@ -88,6 +88,11 @@ jobs:
     defaults:
       run:
         working-directory: android
+    # id-token + attestations: build provenance attestations (issue #586).
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     outputs:
       version_code: ${{ steps.internal.outputs.version_code }}
       promote: ${{ steps.options.outputs.promote }}
@@ -192,6 +197,61 @@ jobs:
       - name: Remove upload keystore
         if: always()
         run: rm -f "$RUNNER_TEMP/upload-keystore.jks"
+
+      # Software bill of materials for the Gradle dependency graph (issue #585).
+      - name: Generate CycloneDX SBOM
+        if: steps.options.outputs.dry_run != 'true'
+        run: ./gradlew cyclonedxBom --no-daemon
+
+      - name: Collect SBOM
+        if: steps.options.outputs.dry_run != 'true'
+        id: sbom
+        run: |
+          SBOM="$(find . -path '*/reports/bom.json' -o -name 'bom.json' | head -n 1)"
+          if [ -z "$SBOM" ]; then
+            echo "::error::cyclonedxBom did not produce a bom.json"
+            exit 1
+          fi
+          cp "$SBOM" "$RUNNER_TEMP/sbom.cdx.json"
+          echo "path=$RUNNER_TEMP/sbom.cdx.json" >> "$GITHUB_OUTPUT"
+
+      - name: Upload SBOM as workflow artifact
+        if: steps.options.outputs.dry_run != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-sbom-${{ github.ref_name }}
+          path: ${{ steps.sbom.outputs.path }}
+          if-no-files-found: error
+
+      # Build provenance for the signed AAB/APK (issue #586).
+      - name: Attest build provenance
+        if: steps.options.outputs.dry_run != 'true'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            android/app/build/outputs/bundle/release/*.aab
+            android/app/build/outputs/apk/release/*.apk
+
+      - name: Attach SBOM to the GitHub release
+        if: steps.options.outputs.dry_run != 'true' && github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SBOM_PATH: ${{ steps.sbom.outputs.path }}
+          TAG: ${{ github.ref_name }}
+        run: gh release upload "$TAG" "$SBOM_PATH#sbom.cdx.json" --clobber
+
+      - name: Push SBOM to the artifact bucket
+        if: steps.options.outputs.dry_run != 'true' && github.ref_type == 'tag'
+        env:
+          SBOM_PATH: ${{ steps.sbom.outputs.path }}
+          TAG: ${{ github.ref_name }}
+          ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
+        run: |
+          if [ -z "$ARTIFACT_BUCKET" ]; then
+            echo "::warning::ARTIFACT_BUCKET is not set; skipping SBOM upload to the artifact bucket."
+            exit 0
+          fi
+          aws s3 cp "$SBOM_PATH" "s3://$ARTIFACT_BUCKET/android/releases/$TAG/sbom.cdx.json"
 
       # A dry run also walks the production lane, so a bad rollout fraction
       # shows up before anyone asks for approval.

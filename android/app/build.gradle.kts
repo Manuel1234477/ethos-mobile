@@ -7,6 +7,22 @@ plugins {
     alias(libs.plugins.ksp)
     alias(libs.plugins.paparazzi)
     jacoco
+    // #585: Emits a CycloneDX SBOM of the app's dependency graph so release APK/AAB
+    // artifacts ship with a machine-readable inventory of their dependencies.
+    id("org.cyclonedx.bom")
+}
+
+// #585: SBOM configuration. The release workflows run `cyclonedxBom` and upload the
+// resulting JSON alongside the APK/AAB. Only the release runtime classpath is described
+// (that is what actually ships inside the artifact), and the component identity is
+// derived from the app's own versionName so the SBOM is traceable to a release.
+tasks.named<org.cyclonedx.gradle.CycloneDxTask>("cyclonedxBom") {
+    includeConfigs.set(listOf("releaseRuntimeClasspath"))
+    outputFormat.set("json")
+    outputName.set("bom")
+    destination.set(layout.buildDirectory.dir("reports/cyclonedx"))
+    componentName.set("com.ethosprotocol")
+    componentVersion.set("1.0.0")
 }
 
 // Release signing credentials come from the environment (CI) or gradle.properties

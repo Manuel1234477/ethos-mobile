@@ -11,6 +11,7 @@ release process, and the deployment procedures for each environment.
 - [Build artifacts](#build-artifacts)
 - [Artifact storage and versioning](#artifact-storage-and-versioning)
 - [Release process](#release-process)
+- [Release security: SBOMs and build provenance](#release-security-sboms-and-build-provenance)
 - [Deployment procedures](#deployment-procedures)
 - [Secrets and configuration](#secrets-and-configuration)
 - [Troubleshooting](#troubleshooting)
@@ -166,6 +167,88 @@ jobs:
     ...
 ```
 
+## Release security: SBOMs and build provenance
+
+Every release produces a machine-readable inventory of its dependencies and a signed
+attestation of the build that produced each binary. Both are published alongside the
+release artifacts so that a dependency CVE can be scoped quickly and so that users
+and store reviewers can verify which commit produced a binary.
+
+### Software bill of materials (SBOM)
+
+The release workflows generate [CycloneDX](https://cyclonedx.org/) SBOMs for both
+dependency graphs:
+
+| Platform | Tool | Dependency graph covered | SBOM file |
+|----------|------|--------------------------|-----------|
+| Android | CycloneDX Gradle plugin (`cyclonedxDirectBuild`) | Gradle (runtime + compile classpaths) | `android-cyclonedx-<version>.json` |
+| iOS | CycloneDX SwiftPM plugin (`cyclonedxAggregate`) | SwiftPM (`Package.resolved`) | `ios-cyclonedx-<version>.json` |
+
+SBOMs are generated in the release jobs (`android-play-store-release.yml`,
+`ios-app-store-release.yml`) and in the Firebase distribution job, and are published
+in two places:
+
+1. **GitHub Release assets** — attached to the GitHub Release created from the
+   `vX.Y.Z` tag, next to the signed `.aab` / `.apk` / `.ipa` and their SHA-256
+   checksums.
+2. **Artifact bucket** — uploaded to S3 alongside the binaries:
+   ```
+   s3://<ARTIFACT_BUCKET>/android/releases/vX.Y.Z/android-cyclonedx-vX.Y.Z.json
+   s3://<ARTIFACT_BUCKET>/ios/releases/vX.Y.Z/ios-cyclonedx-vX.Y.Z.json
+   ```
+   SBOMs follow the same 180-day release retention policy as the binaries (see
+   [Artifact storage and versioning](#artifact-storage-and-versioning)).
+
+To inspect an SBOM locally, download it and run:
+
+```bash
+# List every component and its version
+jq -r '.components[] | "\(.name)@\(.version)"' android-cyclonedx-vX.Y.Z.json
+
+# Find the component that owns a CVE
+jq -r '.components[] | select(.name == "okhttp")' android-cyclonedx-vX.Y.Z.json
+```
+
+### Build provenance attestations
+
+The Android Play, Firebase, and iOS release workflows call
+[`actions/attest-build-provenance`](https://github.com/actions/attest-build-provenance)
+after signing, so each `.aab`, `.apk`, and `.ipa` has a Sigstore-backed attestation
+recording the repository, workflow, commit SHA, and runner that produced it. The
+attestations are stored in the repository's attestation store and are also attached
+to the GitHub Release.
+
+To verify a downloaded artifact, run:
+
+```bash
+gh attestation verify EthosProtocol-vX.Y.Z.ipa --repo <owner>/<repo>
+```
+
+A successful verification prints the attestation details and exits `0`:
+
+```
+Loaded digest sha256:3f2a...c91d for file://EthosProtocol-vX.Y.Z.ipa
+Loaded 1 attestation from GitHub API
+✓ Verification succeeded!
+
+sha256:3f2a...c91d was attested by:
+REPO                PREDICATE_TYPE                  WORKFLOW
+<owner>/<repo>      https://slsa.dev/provenance/v1  .github/workflows/ios-app-store-release.yml@refs/tags/vX.Y.Z
+```
+
+If the artifact was tampered with, or was not built by the expected workflow, the
+command exits non-zero with `✗ Verification failed!` and lists the reason (for
+example `no attestations found` or a digest mismatch). The same command works for
+the Android artifacts:
+
+```bash
+gh attestation verify app-release-vX.Y.Z.aab --repo <owner>/<repo>
+gh attestation verify app-release-vX.Y.Z.apk --repo <owner>/<repo>
+```
+
+Verification requires the GitHub CLI (`gh`) version 2.49 or newer and an
+authenticated session (`gh auth login`).
+
 ## Deployment procedures
 
 ### Staging
@@ -193,7 +276,11 @@ Currently, production deployment is manual. The release manager:
    aws s3 cp s3://<ARTIFACT_BUCKET>/ios/releases/vX.Y.Z/EthosProtocol-vX.Y.Z.ipa .
    aws s3 cp s3://<ARTIFACT_BUCKET>/android/releases/vX.Y.Z/app-release-vX.Y.Z.aab .
    ```
-3. Verifies the SHA-256 checksums.
+3. Verifies the SHA-256 checksums and the build provenance attestation:
+   ```bash
+   gh attestation verify EthosProtocol-vX.Y.Z.ipa --repo <owner>/<repo>
+   gh attestation verify app-release-vX.Y.Z.aab --repo <owner>/<repo>
+   ```
 4. Uploads the iOS archive to App Store Connect using Transporter.
 5. Uploads the Android Bundle to the Play Console.
 6. Promotes the build to the desired track (internal → beta → production) in the
@@ -270,3 +357,16 @@ command to compute a pin.
 
 **Artifact upload fails with "AccessDenied" or "NoSuchBucket":**
 See [docs/artifact-storage.md#troubleshooting](artifact-storage.md#troubleshooting).
+
+**`gh attestation verify` fails with "no attestations found":**
+The artifact was not produced by a release workflow, or the attestation was not
+published. Confirm the file was downloaded from the GitHub Release for the tag (not
+rebuilt locally) and that the `--repo` value matches the repository that ran the
+release workflow. Attestations are only created for artifacts built by
+`android-play-store-release.yml`, the Firebase distribution job, and
+`ios-app-store-release.yml`.
+
+**SBOM is missing from the release:**
+Check that the `cyclonedxDirectBuild` (Android) or `cyclonedxAggregate` (iOS) task ran
+in the release job logs. A failed SBOM generation fails the job, so a missing SBOM
+usually means the release job did not complete.

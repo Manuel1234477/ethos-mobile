@@ -17,6 +17,9 @@ name: Build Artifact Storage and Versioning
 #         v1.4.0/
 #           EthosProtocol-v1.4.0.ipa
 #           EthosProtocol-v1.4.0.ipa.sha256
+#           SHA256SUMS               (combined manifest of every object)
+#           SHA256SUMS.sig           (cosign detached signature)
+#           SHA256SUMS.pem           (cosign signing certificate)
 #           metadata.json
 #       snapshots/
 #         main/
@@ -30,6 +33,9 @@ name: Build Artifact Storage and Versioning
 #           app-release.apk          (split APK for sideloading / QA)
 #           app-release.aab.sha256
 #           app-release.apk.sha256
+#           SHA256SUMS
+#           SHA256SUMS.sig
+#           SHA256SUMS.pem
 #           metadata.json
 #       snapshots/
 #         main/
@@ -39,9 +45,26 @@ name: Build Artifact Storage and Versioning
 #       v1.4.0/
 #         mapping.txt
 #
+# Integrity & signing (#587)
+# --------------------------
+#   Every release directory contains a SHA256SUMS manifest listing the SHA-256
+#   of each uploaded object. The manifest is signed with cosign (keyless OIDC)
+#   producing SHA256SUMS.sig and SHA256SUMS.pem. Consumers MUST verify before
+#   use:
+#
+#     cosign verify-blob \
+#       --certificate SHA256SUMS.pem \
+#       --signature   SHA256SUMS.sig \
+#       --certificate-identity-regexp 'https://github.com/<owner>/<repo>/.*' \
+#       --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+#       SHA256SUMS
+#     sha256sum -c SHA256SUMS
+#
 # Retention policies (managed by scripts/manage_artifact_retention.py)
 # --------------------------------------------------------------------
 #   releases/  — 180 days (configurable via ARTIFACT_RELEASE_RETENTION_DAYS)
+#                Objects tagged `retention=keep` (currently deployed versions
+#                and versions with live crash reports) are exempt from expiry.
 #   snapshots/ — 30  days (configurable via ARTIFACT_SNAPSHOT_RETENTION_DAYS)
 #
 # Triggers
@@ -97,6 +120,8 @@ on:
 
 permissions:
   contents: read
+  # Required for cosign keyless signing (OIDC token exchange with Fulcio).
+  id-token: write
 
 # Only one archive job runs per ref at a time; newer pushes cancel in-flight
 # snapshot runs but never cancel a tag (release) run.
@@ -109,6 +134,7 @@ env:
   ARTIFACT_BUCKET: ${{ secrets.ARTIFACT_BUCKET }}
   RELEASE_RETENTION_DAYS: ${{ vars.ARTIFACT_RELEASE_RETENTION_DAYS || '180' }}
   SNAPSHOT_RETENTION_DAYS: ${{ vars.ARTIFACT_SNAPSHOT_RETENTION_DAYS || '30' }}
+  COSIGN_EXPERIMENTAL: "1"
   FASTLANE_SKIP_UPDATE_CHECK: "1"
   FASTLANE_HIDE_CHANGELOG: "1"
   FASTLANE_OPT_OUT_USAGE: "1"
@@ -221,6 +247,9 @@ jobs:
       - name: Install XcodeGen
         run: brew install xcodegen
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
       - name: Generate Xcode project
         run: |
           mkdir -p Xcode
@@ -307,21 +336,55 @@ jobs:
           IPA_PATH: ${{ steps.build_ipa.outputs.ipa_path }}
           LABEL: ${{ needs.version.outputs.label }}
 
+      # Build the combined SHA256SUMS manifest covering every object that will
+      # be uploaded to the release directory, then sign it with cosign.
+      - name: Generate and sign SHA256SUMS manifest
+        id: manifest_ios
+        env:
+          IPA_PATH: ${{ steps.build_ipa.outputs.ipa_path }}
+          SHA_FILE: ${{ steps.checksum_ios.outputs.sha256_file }}
+        run: |
+          MANIFEST_DIR="artifacts/signed"
+          mkdir -p "$MANIFEST_DIR"
+          MANIFEST="$MANIFEST_DIR/SHA256SUMS"
+
+          # Copy the artifacts into a staging dir so the manifest paths are
+          # relative to the release directory root.
+          cp "$IPA_PATH" "$MANIFEST_DIR/$(basename "$IPA_PATH")"
+          cp "$SHA_FILE" "$MANIFEST_DIR/$(basename "$SHA_FILE")"
+          cp "artifacts/metadata.json" "$MANIFEST_DIR/metadata.json"
+
+          # Generate the manifest (sorted for determinism).
+          ( cd "$MANIFEST_DIR" && \
+            shasum -a 256 $(ls | grep -v '^SHA256SUMS' | sort) > SHA256SUMS )
+
+          echo "--- SHA256SUMS ---"
+          cat "$MANIFEST"
+
+          # Keyless signing via GitHub OIDC (Fulcio + Rekor).
+          cosign sign-blob --yes \
+            --output-signature "$MANIFEST.sig" \
+            --output-certificate "$MANIFEST.pem" \
+            "$MANIFEST"
+
+          echo "manifest_dir=$MANIFEST_DIR" >> "$GITHUB_OUTPUT"
+
       - name: Upload .ipa to S3
         if: ${{ inputs.dry_run != true }}
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ARTIFACT_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_ARTIFACT_SECRET_ACCESS_KEY }}
           S3_PREFIX: ${{ needs.version.outputs.s3_prefix_ios }}
+          MANIFEST_DIR: ${{ steps.manifest_ios.outputs.manifest_dir }}
         run: |
-          IPA="${{ steps.build_ipa.outputs.ipa_path }}"
-          SHA_FILE="${{ steps.checksum_ios.outputs.sha256_file }}"
           S3_URI="s3://${ARTIFACT_BUCKET}/${S3_PREFIX}"
 
           echo "Uploading to ${S3_URI}"
-          aws s3 cp "$IPA" "${S3_URI}/$(basename $IPA)"
-          aws s3 cp "$SHA_FILE" "${S3_URI}/$(basename $SHA_FILE)"
-          aws s3 cp "artifacts/metadata.json" "${S3_URI}/metadata.json"
+          # Upload every staged object (artifact, .sha256, metadata.json,
+          # SHA256SUMS, SHA256SUMS.sig, SHA256SUMS.pem).
+          for f in "$MANIFEST_DIR"/*; do
+            aws s3 cp "$f" "${S3_URI}/$(basename "$f")"
+          done
 
           echo "✓ iOS artifact uploaded to ${S3_URI}"
           echo "SHA-256: ${{ steps.checksum_ios.outputs.sha256 }}"
@@ -332,6 +395,7 @@ jobs:
           echo "### Dry run — iOS artifact NOT uploaded" >> "$GITHUB_STEP_SUMMARY"
           echo "Would upload to: s3://\${ARTIFACT_BUCKET}/${{ needs.version.outputs.s3_prefix_ios }}" >> "$GITHUB_STEP_SUMMARY"
           echo "SHA-256: ${{ steps.checksum_ios.outputs.sha256 }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Manifest: ${{ steps.manifest_ios.outputs.manifest_dir }}/SHA256SUMS (signed)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload .ipa as GitHub Actions artifact (fallback / inspection)
         if: always()
@@ -342,6 +406,9 @@ jobs:
             ${{ steps.build_ipa.outputs.ipa_path }}
             ${{ steps.checksum_ios.outputs.sha256_file }}
             ios/EthosProtocol/artifacts/metadata.json
+            ios/EthosProtocol/artifacts/signed/SHA256SUMS
+            ios/EthosProtocol/artifacts/signed/SHA256SUMS.sig
+            ios/EthosProtocol/artifacts/signed/SHA256SUMS.pem
           retention-days: 14
           if-no-files-found: warn
 
@@ -376,6 +443,9 @@ jobs:
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
@@ -494,6 +564,42 @@ jobs:
           LABEL: ${{ needs.version.outputs.label }}
           SIGNED: ${{ steps.keystore.outputs.signed }}
 
+      # Build the combined SHA256SUMS manifest covering every object that will
+      # be uploaded to the release directory, then sign it with cosign.
+      - name: Generate and sign SHA256SUMS manifest
+        id: manifest_android
+        env:
+          AAB_PATH: ${{ steps.paths.outputs.aab_path }}
+          APK_PATH: ${{ steps.paths.outputs.apk_path }}
+        run: |
+          MANIFEST_DIR="artifacts/signed"
+          mkdir -p "$MANIFEST_DIR"
+          MANIFEST="$MANIFEST_DIR/SHA256SUMS"
+
+          # Stage every object that will be uploaded to the release directory.
+          cp "$AAB_PATH" "$MANIFEST_DIR/$(basename "$AAB_PATH")"
+          cp "${AAB_PATH}.sha256" "$MANIFEST_DIR/$(basename "$AAB_PATH").sha256"
+          if [ -n "$APK_PATH" ] && [ -f "$APK_PATH" ]; then
+            cp "$APK_PATH" "$MANIFEST_DIR/$(basename "$APK_PATH")"
+            cp "${APK_PATH}.sha256" "$MANIFEST_DIR/$(basename "$APK_PATH").sha256"
+          fi
+          cp "artifacts/metadata.json" "$MANIFEST_DIR/metadata.json"
+
+          # Generate the manifest (sorted for determinism).
+          ( cd "$MANIFEST_DIR" && \
+            sha256sum $(ls | grep -v '^SHA256SUMS' | sort) > SHA256SUMS )
+
+          echo "--- SHA256SUMS ---"
+          cat "$MANIFEST"
+
+          # Keyless signing via GitHub OIDC (Fulcio + Rekor).
+          cosign sign-blob --yes \
+            --output-signature "$MANIFEST.sig" \
+            --output-certificate "$MANIFEST.pem" \
+            "$MANIFEST"
+
+          echo "manifest_dir=$MANIFEST_DIR" >> "$GITHUB_OUTPUT"
+
       - name: Upload artifacts to S3
         if: ${{ inputs.dry_run != true }}
         env:
@@ -501,22 +607,17 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_ARTIFACT_SECRET_ACCESS_KEY }}
           S3_PREFIX: ${{ needs.version.outputs.s3_prefix_android }}
           S3_MAPPING_PREFIX: ${{ needs.version.outputs.s3_prefix_mappings }}
-          AAB_PATH: ${{ steps.paths.outputs.aab_path }}
-          APK_PATH: ${{ steps.paths.outputs.apk_path }}
+          MANIFEST_DIR: ${{ steps.manifest_android.outputs.manifest_dir }}
           VERSION_LABEL: ${{ needs.version.outputs.label }}
         run: |
           S3_URI="s3://${ARTIFACT_BUCKET}/${S3_PREFIX}"
           echo "Uploading Android artifacts to ${S3_URI}"
 
-          aws s3 cp "$AAB_PATH" "${S3_URI}/$(basename $AAB_PATH)"
-          aws s3 cp "${AAB_PATH}.sha256" "${S3_URI}/$(basename $AAB_PATH).sha256"
-
-          if [ -n "$APK_PATH" ] && [ -f "$APK_PATH" ]; then
-            aws s3 cp "$APK_PATH" "${S3_URI}/$(basename $APK_PATH)"
-            aws s3 cp "${APK_PATH}.sha256" "${S3_URI}/$(basename $APK_PATH).sha256"
-          fi
-
-          aws s3 cp "artifacts/metadata.json" "${S3_URI}/metadata.json"
+          # Upload every staged object (aab/apk, .sha256 files, metadata.json,
+          # SHA256SUMS, SHA256SUMS.sig, SHA256SUMS.pem).
+          for f in "$MANIFEST_DIR"/*; do
+            aws s3 cp "$f" "${S3_URI}/$(basename "$f")"
+          done
 
           # Archive R8 mapping alongside the release artifacts
           MAPPING="artifacts/mapping-${VERSION_LABEL}.txt"
@@ -533,6 +634,7 @@ jobs:
           echo "### Dry run — Android artifacts NOT uploaded" >> "$GITHUB_STEP_SUMMARY"
           echo "Would upload to: s3://\${ARTIFACT_BUCKET}/${{ needs.version.outputs.s3_prefix_android }}" >> "$GITHUB_STEP_SUMMARY"
           echo "AAB SHA-256: ${{ steps.checksum_android.outputs.aab_sha256 }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Manifest: ${{ steps.manifest_android.outputs.manifest_dir }}/SHA256SUMS (signed)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Remove upload keystore
         if: always()
@@ -547,6 +649,73 @@ jobs:
             android/artifacts/
           retention-days: 14
           if-no-files-found: warn
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Verify signatures and checksums in the download path (#587)
+  # ───────────────────────────────────────────────────────────────────────────
+  verify-artifacts:
+    name: Verify signed artifacts (download path)
+    needs: [version, ios-archive, android-archive]
+    # Only verify when we actually uploaded (not a dry run) and at least one
+    # archive job succeeded.
+    if: |
+      always() &&
+      inputs.dry_run != true &&
+      (needs.ios-archive.result == 'success' ||
+       needs.android-archive.result == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ARTIFACT_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_ARTIFACT_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Verify iOS release artifacts
+        if: needs.ios-archive.result == 'success'
+        env:
+          S3_PREFIX: ${{ needs.version.outputs.s3_prefix_ios }}
+        run: |
+          WORK=$(mktemp -d)
+          S3_URI="s3://${ARTIFACT_BUCKET}/${S3_PREFIX}"
+          aws s3 cp --recursive "$S3_URI" "$WORK"
+          cd "$WORK"
+
+          echo "Verifying cosign signature on SHA256SUMS"
+          cosign verify-blob \
+            --certificate SHA256SUMS.pem \
+            --signature   SHA256SUMS.sig \
+            --certificate-identity-regexp "https://github.com/${GITHUB_REPOSITORY}/.*" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            SHA256SUMS
+
+          echo "Verifying SHA-256 checksums"
+          sha256sum -c SHA256SUMS
+
+      - name: Verify Android release artifacts
+        if: needs.android-archive.result == 'success'
+        env:
+          S3_PREFIX: ${{ needs.version.outputs.s3_prefix_android }}
+        run: |
+          WORK=$(mktemp -d)
+          S3_URI="s3://${ARTIFACT_BUCKET}/${S3_PREFIX}"
+          aws s3 cp --recursive "$S3_URI" "$WORK"
+          cd "$WORK"
+
+          echo "Verifying cosign signature on SHA256SUMS"
+          cosign verify-blob \
+            --certificate SHA256SUMS.pem \
+            --signature   SHA256SUMS.sig \
+            --certificate-identity-regexp "https://github.com/${GITHUB_REPOSITORY}/.*" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            SHA256SUMS
+
+          echo "Verifying SHA-256 checksums"
+          sha256sum -c SHA256SUMS
 
   # ───────────────────────────────────────────────────────────────────────────
   # Apply S3 lifecycle / retention policy
@@ -565,19 +734,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Apply lifecycle rules to S3 bucket
-        if: ${{ inputs.dry_run != true }}
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ARTIFACT_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_ARTIFACT_SECRET_ACCESS_KEY }}
-        run: |
-          python3 scripts/manage_artifact_retention.py \
-            --bucket "$ARTIFACT_BUCKET" \
-            --release-days "$RELEASE_RETENTION_DAYS" \
-            --snapshot-days "$SNAPSHOT_RETENTION_DAYS"
-
-      - name: Summarise (dry run)
-        if: ${{ inputs.dry_run == true }}
-        run: |
-          echo "### Dry run — retention policy NOT applied" >> "$GITHUB_STEP_SUMMARY"
-          echo "Would apply: releases → ${RELEASE_RETENTION_DAYS} days, snapshots → ${SNAPSHOT_RETENTION_DAYS} days" >> "$GITHUB_STEP_SUMMARY"
+      - name
