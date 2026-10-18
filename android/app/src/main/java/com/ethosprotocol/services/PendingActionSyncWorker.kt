@@ -42,7 +42,7 @@ class PendingActionSyncWorker @AssistedInject constructor(
         val startMs = System.currentTimeMillis()
         val runAtIso = isoTimestamp(startMs)
 
-        val pending = compactConflicts(dao.getAll())
+        val pending = compactConflicts(dao.getAll()).filterNot { it.deadLetter }
         if (pending.isEmpty()) {
             recordOutcome(runAtIso, succeeded = 0, failed = 0, retrying = false, queued = 0, lastModifiedAt = null)
             Log.i(TAG, "run finished — nothing to sync")
@@ -64,8 +64,21 @@ class PendingActionSyncWorker @AssistedInject constructor(
                 continue
             }
 
+            // Validate the row before dispatch. A malformed row (null field from a migration
+            // or a partial write) must not throw inside the worker, or it would be retried
+            // forever and block the rest of the queue. Move it to the dead-letter state and
+            // carry on with the next item.
+            val invalidReason = validate(item)
+            if (invalidReason != null) {
+                dao.markDeadLetter(item.id)
+                permanentlyFailed++
+                Log.e(TAG, "action dead-lettered (invalid row) type=${item.type} id=${item.id} reason=$invalidReason")
+                continue
+            }
+
             val result = when (item.type) {
-                PendingActionType.CHECK_IN -> apiClient.checkIn(item.vaultId!!, item.idempotencyKey)
+                PendingActionType.CHECK_IN ->
+                    apiClient.checkIn(item.vaultId!!, item.idempotencyKey)
                 PendingActionType.CREATE_VAULT ->
                     apiClient.createVault(
                         Json.decodeFromString<CreateVaultRequest>(item.payloadJson!!),
@@ -106,12 +119,12 @@ class PendingActionSyncWorker @AssistedInject constructor(
             }
         }
 
-        if (dao.getAll().isEmpty()) {
+        if (dao.getAll().none { !it.deadLetter }) {
             notificationHelper.cancelQueuedActions()
         }
 
         val willRetry = hasRetryableFailure
-        val remaining = dao.getAll()
+        val remaining = dao.getAll().filterNot { it.deadLetter }
         recordOutcome(
             runAtIso,
             succeeded,
@@ -127,6 +140,24 @@ class PendingActionSyncWorker @AssistedInject constructor(
         )
 
         return if (willRetry) Result.retry() else Result.success()
+    }
+
+    /**
+     * Returns a non-sensitive reason string if [item] is malformed and cannot be dispatched,
+     * or null if it is valid. Reasons never include payload contents.
+     */
+    private fun validate(item: PendingAction): String? = when (item.type) {
+        PendingActionType.CHECK_IN ->
+            if (item.vaultId.isNullOrBlank()) "missing vaultId" else null
+        PendingActionType.CREATE_VAULT -> when {
+            item.payloadJson.isNullOrBlank() -> "missing payloadJson"
+            else -> try {
+                Json.decodeFromString<CreateVaultRequest>(item.payloadJson)
+                null
+            } catch (e: Exception) {
+                "unparseable payloadJson"
+            }
+        }
     }
 
     /**
