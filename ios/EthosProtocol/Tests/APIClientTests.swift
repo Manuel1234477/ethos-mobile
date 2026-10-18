@@ -9,6 +9,9 @@ final class MockURLProtocol: URLProtocol {
     static var mockResponses: [String: (data: Data, response: URLResponse)] = [:]
     static var mockErrors: [String: Error] = [:]
     static var requestedURLs: [URL] = []
+    /// Requests captured in arrival order, so tests can inspect headers (e.g. X-Nonce /
+    /// X-Timestamp) of each attempt — including retries — and count attempts.
+    static var capturedRequests: [URLRequest] = []
 
     override class func canInit(with request: URLRequest) -> Bool {
         return true
@@ -24,8 +27,9 @@ final class MockURLProtocol: URLProtocol {
             return
         }
 
-        // Record the URL for verification
+        // Record the URL and full request for verification
         Self.requestedURLs.append(url)
+        Self.capturedRequests.append(request)
 
         // Check if there's a mock error for this URL
         if let error = Self.mockErrors[url.absoluteString] {
@@ -52,6 +56,7 @@ final class MockURLProtocol: URLProtocol {
         mockResponses.removeAll()
         mockErrors.removeAll()
         requestedURLs.removeAll()
+        capturedRequests.removeAll()
     }
 }
 
@@ -425,5 +430,166 @@ final class APIClientAuthTests: XCTestCase {
         try await client.revokeOtherSessions()
 
         XCTAssertTrue(MockURLProtocol.requestedURLs.contains { $0.absoluteString == sessionsURL })
+    }
+}
+
+// MARK: - #609 replay_detected Recovery Tests
+
+/// A URLProtocol that serves a scripted sequence of responses for a single URL, so a test
+/// can simulate "first attempt fails with replay_detected, retry succeeds".
+final class SequencedMockURLProtocol: URLProtocol {
+    static var sequences: [String: [(data: Data, response: URLResponse)]] = [:]
+    static var capturedRequests: [URLRequest] = []
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let url = request.url else {
+            client?.urlProtocol(self, didFailWithError: APIError.serverError("No URL"))
+            return
+        }
+        Self.capturedRequests.append(request)
+
+        guard var sequence = Self.sequences[url.absoluteString], !sequence.isEmpty else {
+            let error = NSError(domain: "SequencedMockURLProtocol", code: 404, userInfo: nil)
+            client?.urlProtocol(self, didFailWithError: error)
+            return
+        }
+
+        let next = sequence.removeFirst()
+        Self.sequences[url.absoluteString] = sequence
+
+        client?.urlProtocol(self, didReceive: next.response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: next.data)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+
+    static func reset() {
+        sequences.removeAll()
+        capturedRequests.removeAll()
+    }
+}
+
+final class APIClientReplayRecoveryTests: XCTestCase {
+
+    var client: APIClient!
+    let checkInURL = "https://api.ethos-protocol.app/v1/vaults/vault-1/checkin"
+    let vaultsURL = "https://api.ethos-protocol.app/v1/vaults"
+
+    override func setUpWithError() throws {
+        super.setUp()
+        SequencedMockURLProtocol.reset()
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [SequencedMockURLProtocol.self]
+        let session = URLSession(configuration: config)
+        client = APIClient.makeTestInstance(session: session)
+    }
+
+    override func tearDownWithError() throws {
+        SequencedMockURLProtocol.reset()
+        super.tearDown()
+    }
+
+    private func response(for url: String, status: Int) -> HTTPURLResponse {
+        HTTPURLResponse(url: URL(string: url)!, statusCode: status, httpVersion: "HTTP/1.1", headerFields: nil)!
+    }
+
+    private func replayBody() -> Data {
+        Data(#"{"error": "replay_detected"}"#.utf8)
+    }
+
+    private func enqueue(_ url: String, status: Int, body: Data) {
+        var sequence = SequencedMockURLProtocol.sequences[url] ?? []
+        sequence.append((data: body, response: response(for: url, status: status)))
+        SequencedMockURLProtocol.sequences[url] = sequence
+    }
+
+    private func header(_ request: URLRequest, _ name: String) -> String? {
+        request.value(forHTTPHeaderField: name)
+    }
+
+    // MARK: 400 replay_detected on a mutating request
+
+    func test_checkIn_400ReplayDetected_retriesOnceWithFreshNonceAndTimestamp() async throws {
+        enqueue(checkInURL, status: 400, body: replayBody())
+        enqueue(checkInURL, status: 200, body: Data("{}".utf8))
+
+        try await client.checkIn(vaultId: "vault-1")
+
+        let attempts = SequencedMockURLProtocol.capturedRequests.filter {
+            $0.url?.absoluteString == checkInURL
+        }
+        XCTAssertEqual(attempts.count, 2, "Expected exactly one retry after replay_detected")
+
+        let firstNonce = header(attempts[0], "X-Nonce")
+        let secondNonce = header(attempts[1], "X-Nonce")
+        XCTAssertNotNil(firstNonce)
+        XCTAssertNotNil(secondNonce)
+        XCTAssertNotEqual(firstNonce, secondNonce, "Retry must send a fresh X-Nonce")
+
+        let firstTimestamp = header(attempts[0], "X-Timestamp")
+        let secondTimestamp = header(attempts[1], "X-Timestamp")
+        XCTAssertNotNil(firstTimestamp)
+        XCTAssertNotNil(secondTimestamp)
+        XCTAssertNotEqual(firstTimestamp, secondTimestamp, "Retry must send a fresh X-Timestamp")
+    }
+
+    // MARK: 403 replay_detected on a mutating request
+
+    func test_checkIn_403ReplayDetected_retriesOnceWithFreshNonceAndTimestamp() async throws {
+        enqueue(checkInURL, status: 403, body: replayBody())
+        enqueue(checkInURL, status: 200, body: Data("{}".utf8))
+
+        try await client.checkIn(vaultId: "vault-1")
+
+        let attempts = SequencedMockURLProtocol.capturedRequests.filter {
+            $0.url?.absoluteString == checkInURL
+        }
+        XCTAssertEqual(attempts.count, 2, "Expected exactly one retry after replay_detected")
+
+        XCTAssertNotEqual(header(attempts[0], "X-Nonce"), header(attempts[1], "X-Nonce"))
+        XCTAssertNotEqual(header(attempts[0], "X-Timestamp"), header(attempts[1], "X-Timestamp"))
+    }
+
+    // MARK: Second replay_detected must not trigger a third attempt
+
+    func test_checkIn_repeatedReplayDetected_throwsWithoutThirdAttempt() async throws {
+        enqueue(checkInURL, status: 400, body: replayBody())
+        enqueue(checkInURL, status: 400, body: replayBody())
+
+        do {
+            try await client.checkIn(vaultId: "vault-1")
+            XCTFail("Expected checkIn to throw after a second replay_detected")
+        } catch {
+            // expected — recovery is attempted only once
+        }
+
+        let attempts = SequencedMockURLProtocol.capturedRequests.filter {
+            $0.url?.absoluteString == checkInURL
+        }
+        XCTAssertEqual(attempts.count, 2, "Must not retry more than once for replay_detected")
+    }
+
+    // MARK: GET requests are not retried on replay_detected
+
+    func test_listVaults_400ReplayDetected_doesNotRetry() async throws {
+        let paginatedURL = "\(vaultsURL)?limit=\(APIClient.defaultVaultPageSize)"
+        enqueue(paginatedURL, status: 400, body: replayBody())
+
+        do {
+            _ = try await client.listVaults()
+            XCTFail("Expected listVaults to throw for replay_detected")
+        } catch {
+            // expected
+        }
+
+        let attempts = SequencedMockURLProtocol.capturedRequests.filter {
+            $0.url?.absoluteString == paginatedURL
+        }
+        XCTAssertEqual(attempts.count, 1, "GET requests must not be retried on replay_detected")
     }
 }

@@ -181,6 +181,120 @@ class ApiClientTest {
         assertEquals("Unauthorized", (result as ApiResult.Error).message)
     }
 
+    // #609: replay_detected on a mutating request must regenerate the nonce/timestamp and retry once.
+    @Test
+    fun `replay_detected on 400 retries a mutating request with a fresh nonce and timestamp`() = runTest {
+        every { tokenProvider.token } returns "good-token"
+        every { tokenProvider.isNearExpiry() } returns false
+
+        val nonces = mutableListOf<String>()
+        val timestamps = mutableListOf<String>()
+        var attempts = 0
+        val engine = MockEngine { request ->
+            nonces += request.headers["X-Nonce"].orEmpty()
+            timestamps += request.headers["X-Timestamp"].orEmpty()
+            attempts++
+            if (attempts == 1) {
+                respond(
+                    content = """{"error":"replay_detected"}""",
+                    status = HttpStatusCode.BadRequest,
+                    headers = headersOf(HttpHeaders.ContentType, "application/json")
+                )
+            } else {
+                respond(
+                    content = """{"id":"vault-1"}""",
+                    status = HttpStatusCode.OK,
+                    headers = headersOf(HttpHeaders.ContentType, "application/json")
+                )
+            }
+        }
+        val apiClient = ApiClient(tokenProvider, networkMonitor, offlineCache, "https://test", engine)
+
+        val result = apiClient.createVault(com.ethosprotocol.models.CreateVaultRequest(name = "Test"))
+
+        assertTrue(result is ApiResult.Success)
+        assertEquals(2, attempts)
+        assertTrue(nonces[0].isNotEmpty())
+        assertTrue(nonces[1].isNotEmpty())
+        assertTrue(nonces[0] != nonces[1])
+        assertTrue(timestamps[0].isNotEmpty())
+        assertTrue(timestamps[1].isNotEmpty())
+    }
+
+    @Test
+    fun `replay_detected on 403 retries a mutating request once`() = runTest {
+        every { tokenProvider.token } returns "good-token"
+        every { tokenProvider.isNearExpiry() } returns false
+
+        var attempts = 0
+        val engine = MockEngine {
+            attempts++
+            if (attempts == 1) {
+                respond(
+                    content = """{"error":"replay_detected"}""",
+                    status = HttpStatusCode.Forbidden,
+                    headers = headersOf(HttpHeaders.ContentType, "application/json")
+                )
+            } else {
+                respond(
+                    content = """{"id":"vault-1"}""",
+                    status = HttpStatusCode.OK,
+                    headers = headersOf(HttpHeaders.ContentType, "application/json")
+                )
+            }
+        }
+        val apiClient = ApiClient(tokenProvider, networkMonitor, offlineCache, "https://test", engine)
+
+        val result = apiClient.createVault(com.ethosprotocol.models.CreateVaultRequest(name = "Test"))
+
+        assertTrue(result is ApiResult.Success)
+        assertEquals(2, attempts)
+    }
+
+    @Test
+    fun `a second replay_detected surfaces an error without a third attempt`() = runTest {
+        every { tokenProvider.token } returns "good-token"
+        every { tokenProvider.isNearExpiry() } returns false
+
+        var attempts = 0
+        val engine = MockEngine {
+            attempts++
+            respond(
+                content = """{"error":"replay_detected"}""",
+                status = HttpStatusCode.BadRequest,
+                headers = headersOf(HttpHeaders.ContentType, "application/json")
+            )
+        }
+        val apiClient = ApiClient(tokenProvider, networkMonitor, offlineCache, "https://test", engine)
+
+        val result = apiClient.createVault(com.ethosprotocol.models.CreateVaultRequest(name = "Test"))
+
+        assertTrue(result is ApiResult.Error)
+        assertEquals(2, attempts)
+    }
+
+    @Test
+    fun `replay_detected on a GET is not retried`() = runTest {
+        every { tokenProvider.token } returns "good-token"
+        every { tokenProvider.isNearExpiry() } returns false
+
+        var attempts = 0
+        val engine = MockEngine {
+            attempts++
+            respond(
+                content = """{"error":"replay_detected"}""",
+                status = HttpStatusCode.BadRequest,
+                headers = headersOf(HttpHeaders.ContentType, "application/json")
+            )
+        }
+        val apiClient = ApiClient(tokenProvider, networkMonitor, offlineCache, "https://test", engine)
+
+        val result = apiClient.listVaults()
+
+        assertTrue(result is ApiResult.Error)
+        assertEquals(1, attempts)
+    }
+
     // #211: an expired recovery token/proof on completeRecovery must surface a clear,
     // actionable message — not the generic "Unauthorized" shown for a rejected session.
     @Test

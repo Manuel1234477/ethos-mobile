@@ -1,6 +1,17 @@
 package com.ethosprotocol
 
 import android.content.Context
+import androidx.room.testing.MigrationTestHelper
+import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
+import com.ethosprotocol.services.PendingActionDatabase
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Rule
+import org.junit.Test
+import org.junit.runner.RunWith
 import androidx.work.ListenableWorker
 import androidx.work.WorkerParameters
 import com.ethosprotocol.api.ApiClient
@@ -183,4 +194,54 @@ class PendingActionSyncWorkerTest {
         lastCheckIn = "2026-04-01T00:00:00Z", ttlRemaining = 2_592_000L,
         status = VaultStatus.active
     )
+}
+
+@RunWith(AndroidJUnit4::class)
+class PendingActionDatabaseMigrationTest {
+
+    private val testDbName = "pending-action-migration-test.db"
+
+    @get:Rule
+    val helper = MigrationTestHelper(
+        InstrumentationRegistry.getInstrumentation(),
+        PendingActionDatabase::class.java,
+        emptyList(),
+        FrameworkSQLiteOpenHelperFactory()
+    )
+
+    @Test
+    fun migrate1To2_preservesQueuedActionsAndPopulatesNewColumns() {
+        helper.createDatabase(testDbName, 1).apply {
+            execSQL(
+                "INSERT INTO pending_actions (id, type, vaultId, payloadJson, queuedAt, dedupeKey) " +
+                    "VALUES (1, 'CHECK_IN', 'v1', NULL, 1, 'check_in:v1')"
+            )
+            close()
+        }
+
+        val db = helper.runMigrationsAndValidate(
+            testDbName,
+            2,
+            true,
+            PendingActionDatabase.MIGRATION_1_2
+        )
+
+        db.query(
+            "SELECT id, type, vaultId, queuedAt, dedupeKey, idempotencyKey, synced " +
+                "FROM pending_actions WHERE id = 1"
+        ).use { cursor ->
+            assertEquals(1, cursor.count)
+            cursor.moveToFirst()
+            assertEquals(1, cursor.getInt(0))
+            assertEquals("CHECK_IN", cursor.getString(1))
+            assertEquals("v1", cursor.getString(2))
+            assertEquals(1L, cursor.getLong(3))
+            assertEquals("check_in:v1", cursor.getString(4))
+            assertNotNull(cursor.getString(5))
+            assertFalse(cursor.isNull(5))
+            assertEquals(0, cursor.getInt(6))
+        }
+
+        db.close()
+    }
 }

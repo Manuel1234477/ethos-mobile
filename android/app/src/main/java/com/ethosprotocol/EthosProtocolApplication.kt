@@ -7,6 +7,7 @@ import androidx.hilt.work.HiltWorkerFactory
 import androidx.work.Configuration
 import com.ethosprotocol.analytics.SessionAnalytics
 import com.ethosprotocol.crash.CrashReporter
+import com.ethosprotocol.pendingactions.PendingActionsDatabaseMigrator
 import com.ethosprotocol.utils.AppVersionUpdateChecker
 import com.ethosprotocol.utils.StartupPerformance
 import com.ethosprotocol.widget.VaultWidgetUpdateWorker
@@ -29,6 +30,8 @@ class EthosProtocolApplication : Application(), Configuration.Provider {
 
     @Inject lateinit var sessionAnalytics: SessionAnalytics
 
+    @Inject lateinit var pendingActionsDatabaseMigrator: PendingActionsDatabaseMigrator
+
     override val workManagerConfiguration: Configuration
         get() = Configuration.Builder()
             .setWorkerFactory(workerFactory)
@@ -37,6 +40,12 @@ class EthosProtocolApplication : Application(), Configuration.Provider {
     override fun onCreate() {
         super.onCreate()
         StartupPerformance.markAppStart()
+
+        // Migrate the legacy plaintext pending_actions.db to a SQLCipher-encrypted
+        // database (#612) before any component (WorkManager, repositories) opens it.
+        // The migration is a no-op once the encrypted database exists, and preserves
+        // any queued pending actions from the plaintext store.
+        pendingActionsDatabaseMigrator.migrateIfNeeded()
 
         // Initialize crash reporting as early as possible so that any crash
         // during startup is captured with stack traces, device context and

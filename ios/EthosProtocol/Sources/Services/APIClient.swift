@@ -446,6 +446,41 @@ public final class APIClient {
     }
 
     private func execute(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        // #609: Documented replay_detected recovery (docs/api-error-codes.md). A 400/403
+        // whose body is {"error":"replay_detected"} means the server rejected our
+        // X-Nonce/X-Timestamp (e.g. clock drift). For mutating requests we regenerate
+        // both headers and retry exactly once; GETs are never retried here.
+        let (data, http) = try await perform(request)
+        guard Self.isReplayDetected(statusCode: http.statusCode, data: data),
+              Self.isMutating(method: request.httpMethod) else {
+            return (data, http)
+        }
+        var retryRequest = request
+        for (field, value) in Self.makeAntiReplayHeaders() {
+            retryRequest.setValue(value, forHTTPHeaderField: field)
+        }
+        let (retryData, retryHTTP) = try await perform(retryRequest)
+        if Self.isReplayDetected(statusCode: retryHTTP.statusCode, data: retryData) {
+            // Retry also rejected — surface the normal server error rather than looping.
+            let msg = (try? JSONDecoder().decode([String: String].self, from: retryData))?["error"] ?? "Server error"
+            throw APIError.serverError(msg)
+        }
+        return (retryData, retryHTTP)
+    }
+
+    /// Whether `data` is the documented `{"error":"replay_detected"}` body for a 400/403.
+    static func isReplayDetected(statusCode: Int, data: Data) -> Bool {
+        guard statusCode == 400 || statusCode == 403 else { return false }
+        return (try? JSONDecoder().decode([String: String].self, from: data))?["error"] == "replay_detected"
+    }
+
+    /// POST/DELETE are the mutating verbs this client issues and the only ones that
+    /// carry anti-replay headers, so they're the only ones eligible for replay recovery.
+    static func isMutating(method: String?) -> Bool {
+        method == "POST" || method == "DELETE"
+    }
+
+    private func perform(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         // Falling back to a cached response for a mutating request (POST/DELETE — e.g.
         // check-in, withdraw, disable2FA) would make the app report success for an action
         // that never actually reached the server, which is unacceptable for this app.
@@ -551,6 +586,9 @@ public final class APIClient {
     // GET is the only idempotent verb this client issues — retrying POST/DELETE
     // automatically could double-submit a mutation (check-in, withdrawal, 2FA
     // disable, ...), so only GET requests are eligible for `withRetry`.
+    // (The one exception is the #609 replay_detected recovery in execute(_:), which
+    // retries a mutation once with fresh anti-replay headers — the server rejected
+    // the request before processing it, so no double-submit is possible.)
     static func isRetryable(method: String?) -> Bool { method == "GET" }
 
     private static func isTransientNetworkError(_ error: Error) -> Bool {
