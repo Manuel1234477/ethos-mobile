@@ -160,10 +160,13 @@ class ApiClient(
      * Continue while [VaultPage.hasMore] == true.
      */
     suspend fun listVaults(limit: Int = 20, after: String? = null): ApiResult<VaultPage> {
-        val path = buildString {
-            append("/vaults?limit=$limit")
-            if (after != null) append("&after=$after")
-        }
+        // Cursors are opaque server-issued strings, so they must be percent-encoded:
+        // a raw cursor containing '&', '+', '=' or '#' would otherwise alter the query
+        // and silently skip or repeat results on the next page.
+        val path = URLBuilder("/vaults").apply {
+            parameters.append("limit", limit.toString())
+            if (after != null) parameters.append("after", after)
+        }.buildString()
         return get(path)
     }
     suspend fun getVault(id: String): ApiResult<Vault> = get("/vaults/$id")
