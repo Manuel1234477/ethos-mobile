@@ -38,6 +38,8 @@ jobs:
   # scanning happening without blocking unrelated PRs.
   dependency-check:
     runs-on: ubuntu-latest
+    # Caps the run so a stalled NVD sync cannot hang the job for hours (see #178).
+    timeout-minutes: 45
     # The "Alert on failure" step files a GitHub issue on scheduled-run
     # failures, which needs issues:write — the default GITHUB_TOKEN is
     # read-only, so without this the alert itself fails with a 403.
@@ -82,6 +84,9 @@ jobs:
       # failure — anything else (a real CVSS >= 7.0 finding, or any other error)
       # still fails the job.
       - name: Scan dependencies for high severity vulnerabilities
+        env:
+          # Optional: with a key the NVD feed is not rate-limited (HTTP 429).
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
         run: |
           set +e
           ./gradlew dependencyCheckAggregate 2>&1 | tee dependency-check-output.log
