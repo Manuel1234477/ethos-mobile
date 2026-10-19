@@ -159,18 +159,20 @@ fi
 # it only needs to accept and store it. This catches API contract drift in the
 # notifications endpoint (e.g. a changed required field) before it hits production.
 echo "== 5/5: push notification registration (POST /notifications/register) =="
-nonce=$(openssl rand -hex 32)
-timestamp=$(date +%s)
-status=$(request POST /notifications/register \
-  -H "Content-Type: application/json" \
-  -H "X-Nonce: ${nonce}" \
-  -H "X-Timestamp: ${timestamp}" \
-  -d "{\"token\": \"${PUSH_TOKEN}\", \"platform\": \"ios\"}")
-if [ "$status" != "200" ] && [ "$status" != "204" ]; then
-  fail "POST /notifications/register returned $status: $(cat /tmp/smoke_body.json)"
-else
-  pass "$status"
-fi
+for platform in ${SMOKE_PLATFORMS:-ios android}; do
+  nonce=$(openssl rand -hex 32)
+  timestamp=$(date +%s)
+  status=$(request POST /notifications/register \
+    -H "Content-Type: application/json" \
+    -H "X-Nonce: ${nonce}" \
+    -H "X-Timestamp: ${timestamp}" \
+    -d "{\"token\": \"${PUSH_TOKEN}\", \"platform\": \"${platform}\"}")
+  if [ "$status" != "200" ] && [ "$status" != "204" ]; then
+    fail "POST /notifications/register ($platform) returned $status: $(cat /tmp/smoke_body.json)"
+  else
+    pass "$status ($platform)"
+  fi
+done
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
