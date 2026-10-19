@@ -172,6 +172,20 @@ for platform in ${SMOKE_PLATFORMS:-ios android}; do
   else
     pass "$status ($platform)"
   fi
+
+  # Remove the dummy registration so staging does not accumulate device records.
+  nonce=$(openssl rand -hex 32)
+  timestamp=$(date +%s)
+  status=$(request DELETE /notifications/register \
+    -H "Content-Type: application/json" \
+    -H "X-Nonce: ${nonce}" \
+    -H "X-Timestamp: ${timestamp}" \
+    -d "{\"token\": \"${PUSH_TOKEN}\"}")
+  if [ "$status" != "200" ] && [ "$status" != "204" ]; then
+    fail "DELETE /notifications/register ($platform) returned $status: $(cat /tmp/smoke_body.json)"
+  else
+    pass "$status (unregister $platform)"
+  fi
 done
 
 # ── Summary ───────────────────────────────────────────────────────────────────
