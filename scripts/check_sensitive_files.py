@@ -28,16 +28,21 @@ SENSITIVE_PATTERNS = [
 ]
 
 
+def parse_staged_names(output):
+    """Split `git diff -z --name-only` output. Names are NUL-separated, so non-ASCII names stay unquoted."""
+    return [name for name in output.split("\0") if name]
+
+
 def get_staged_files():
     """Get list of staged files from git."""
     try:
         result = subprocess.run(
-            ["git", "diff", "--cached", "--name-only"],
+            ["git", "diff", "--cached", "-z", "--name-only"],
             capture_output=True,
             text=True,
             check=True,
         )
-        return result.stdout.strip().split("\n") if result.stdout.strip() else []
+        return parse_staged_names(result.stdout)
     except subprocess.CalledProcessError as e:
         print(f"Error getting staged files: {e}", file=sys.stderr)
         return []
