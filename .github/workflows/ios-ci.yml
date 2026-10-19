@@ -10,6 +10,10 @@ defaults:
   run:
     working-directory: ios/EthosProtocol
 
+# Read-only by default. A job that needs more scope must say so itself.
+permissions:
+  contents: read
+
 jobs:
   build-and-test:
     runs-on: macos-latest

@@ -35,6 +35,10 @@ on:
       ETHOS_STAGING_CERT_PINS:
         required: false
 
+# Read-only by default. A job that needs more scope must say so itself.
+permissions:
+  contents: read
+
 jobs:
   # ── Android staging build ─────────────────────────────────────────────────
   android-staging-build:
