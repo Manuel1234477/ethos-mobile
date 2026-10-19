@@ -31,6 +31,11 @@
 
 set -euo pipefail
 
+# Private work directory: parallel runs cannot read each other's files.
+WORK_DIR="$(mktemp -d)"
+export WORK_DIR
+trap 'rm -rf "$WORK_DIR"' EXIT
+
 ASSETLINKS_URL="${ASSETLINKS_URL:-https://ethos-protocol.app/.well-known/assetlinks.json}"
 APP_PACKAGE="${APP_PACKAGE:-com.ethosprotocol}"
 # Default fingerprints list is intentionally empty — CI must inject the real value via the
@@ -44,11 +49,11 @@ FAIL=0
 # ── 1. Fetch ──────────────────────────────────────────────────────────────────
 echo "Fetching: $ASSETLINKS_URL"
 CURL_EXIT=0
-HTTP_CODE=$(curl --silent --output /tmp/assetlinks.json \
+HTTP_CODE=$(curl --silent --output "$WORK_DIR/assetlinks.json" \
                  --write-out "%{http_code}" \
                  --max-time 15 \
                  --fail-with-body \
-                 "$ASSETLINKS_URL" 2>/tmp/assetlinks_err.txt) || CURL_EXIT=$?
+                 "$ASSETLINKS_URL" 2>"$WORK_DIR/assetlinks_err.txt") || CURL_EXIT=$?
 
 # curl never reached the server, so there is no HTTP status to report. Naming the
 # transport failure separately keeps "the domain isn't live / DNS is broken" from
@@ -62,19 +67,19 @@ if [[ "$CURL_EXIT" -ne 0 && "$HTTP_CODE" == "000" ]]; then
         *)  REASON="curl failed with exit code $CURL_EXIT" ;;
     esac
     echo "ERROR: $ASSETLINKS_URL is unreachable: $REASON" >&2
-    cat /tmp/assetlinks_err.txt >&2 2>/dev/null || true
+    cat "$WORK_DIR/assetlinks_err.txt" >&2 2>/dev/null || true
     exit 1
 fi
 
 if [[ "$HTTP_CODE" != "200" ]]; then
     echo "ERROR: Expected HTTP 200, got $HTTP_CODE" >&2
-    cat /tmp/assetlinks_err.txt >&2 2>/dev/null || true
+    cat "$WORK_DIR/assetlinks_err.txt" >&2 2>/dev/null || true
     exit 1
 fi
 echo "OK: HTTP $HTTP_CODE"
 
 # ── 2. Valid JSON ─────────────────────────────────────────────────────────────
-if ! python3 -c "import json,sys; json.load(sys.stdin)" < /tmp/assetlinks.json; then
+if ! python3 -c "import json,sys; json.load(sys.stdin)" < "$WORK_DIR/assetlinks.json"; then
     echo "ERROR: assetlinks.json is not valid JSON" >&2
     FAIL=1
 else
@@ -84,7 +89,7 @@ fi
 # ── 3. Package name present ───────────────────────────────────────────────────
 if python3 - "$APP_PACKAGE" <<'PY'
 import json, sys
-data = json.load(open("/tmp/assetlinks.json"))
+data = json.load(open(__import__("os").environ["WORK_DIR"] + "/assetlinks.json"))
 pkg = sys.argv[1]
 found = any(
     entry.get("target", {}).get("package_name") == pkg
@@ -102,7 +107,7 @@ fi
 # ── 4. Relation present ───────────────────────────────────────────────────────
 if python3 - "$APP_PACKAGE" <<'PY'
 import json, sys
-data = json.load(open("/tmp/assetlinks.json"))
+data = json.load(open(__import__("os").environ["WORK_DIR"] + "/assetlinks.json"))
 pkg = sys.argv[1]
 rel = "delegate_permission/common.handle_all_urls"
 found = any(
@@ -122,7 +127,7 @@ fi
 # ── 5. Namespace is 'android_app' ─────────────────────────────────────────────
 if python3 - "$APP_PACKAGE" <<'PY'
 import json, sys
-data = json.load(open("/tmp/assetlinks.json"))
+data = json.load(open(__import__("os").environ["WORK_DIR"] + "/assetlinks.json"))
 pkg = sys.argv[1]
 found = any(
     entry.get("target", {}).get("namespace") == "android_app"
@@ -152,7 +157,7 @@ else
     MATCH=0
     python3 - "$APP_PACKAGE" "$CERT_FINGERPRINTS" <<'PY' && MATCH=1 || true
 import json, sys
-data = json.load(open("/tmp/assetlinks.json"))
+data = json.load(open(__import__("os").environ["WORK_DIR"] + "/assetlinks.json"))
 pkg  = sys.argv[1]
 # The expected fingerprints are passed as a newline-separated list (each line is one
 # 32-byte-pair, colon-delimited fingerprint).  The env-var convention allows multiple
