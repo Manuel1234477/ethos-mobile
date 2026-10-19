@@ -104,6 +104,17 @@ jobs:
 
           exit "$STATUS"
 
+      # Keeps the scan output as a run artifact, so the cause of a failed scheduled run
+      # can be read without opening the log. Refs #557, #558.
+      - name: Keep dependency-check output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-output
+          path: android/dependency-check-output.log
+          if-no-files-found: ignore
+          retention-days: 30
+
       - name: Alert on failure (scheduled run)
         if: failure() && github.event_name == 'schedule'
         uses: actions/github-script@v7
