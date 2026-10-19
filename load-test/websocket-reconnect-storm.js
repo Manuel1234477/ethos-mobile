@@ -30,7 +30,8 @@ const WS_URL = __ENV.WS_URL || "wss://staging.ethos-protocol.app/ws/vault-events
 const CLIENT_COUNT = parseInt(__ENV.CLIENT_COUNT || "500", 10);
 const JITTER_DISABLED = (__ENV.JITTER_DISABLED || "false") === "true";
 const MAX_ATTEMPTS = parseInt(__ENV.MAX_ATTEMPTS || "8", 10);
-const BASE_DELAY_MS = parseInt(__ENV.BASE_DELAY_MS || "500", 10);
+// Matches the contract's base delay (shared/api-contract.md, Backoff/Jitter).
+const BASE_DELAY_MS = parseInt(__ENV.BASE_DELAY_MS || "1000", 10);
 const MAX_DELAY_MS = parseInt(__ENV.MAX_DELAY_MS || "30000", 10);
 
 export const options = {
