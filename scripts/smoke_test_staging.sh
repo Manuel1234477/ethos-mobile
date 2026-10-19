@@ -140,17 +140,23 @@ fi
 # POST /vaults/{id}/checkin with required anti-replay headers (X-Nonce, X-Timestamp
 # per api-contract.md §Anti-Replay Protection) must return 200.
 echo "== 4/5: check-in (POST /vaults/${STAGING_SMOKE_VAULT_ID}/checkin) =="
-nonce=$(openssl rand -hex 32)
-timestamp=$(date +%s)
-status=$(request POST "/vaults/${STAGING_SMOKE_VAULT_ID}/checkin" \
-  -H "Content-Type: application/json" \
-  -H "X-Nonce: ${nonce}" \
-  -H "X-Timestamp: ${timestamp}" \
-  -d '{}')
-if [ "$status" != "200" ]; then
-  fail "POST /vaults/${STAGING_SMOKE_VAULT_ID}/checkin returned $status: $(cat /tmp/smoke_body.json)"
+# A check-in extends the vault's TTL, which other staging tests may depend on. It runs
+# only when STAGING_SMOKE_ALLOW_CHECKIN=1 is set for a vault created for this purpose.
+if [ "${STAGING_SMOKE_ALLOW_CHECKIN:-0}" != "1" ]; then
+  echo "SKIP: set STAGING_SMOKE_ALLOW_CHECKIN=1 to run check-in against a dedicated vault"
 else
-  pass "$status"
+  nonce=$(openssl rand -hex 32)
+  timestamp=$(date +%s)
+  status=$(request POST "/vaults/${STAGING_SMOKE_VAULT_ID}/checkin" \
+    -H "Content-Type: application/json" \
+    -H "X-Nonce: ${nonce}" \
+    -H "X-Timestamp: ${timestamp}" \
+    -d '{}')
+  if [ "$status" != "200" ]; then
+    fail "POST /vaults/${STAGING_SMOKE_VAULT_ID}/checkin returned $status: $(cat /tmp/smoke_body.json)"
+  else
+    pass "$status"
+  fi
 fi
 
 # ── 5/5: Push notification registration ──────────────────────────────────────
