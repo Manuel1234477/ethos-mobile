@@ -326,9 +326,9 @@ def run(host: str, port: int, warn_days: int,
     all_pins = ios_pins | android_pins
 
     if not all_pins:
-        print("::warning::No pinned certificate hashes found in configured sources — "
+        print("::error::No pinned certificate hashes found in configured sources — "
               "cannot check expiry. Is ETHOS_CERT_PINS set or CertificatePinning.kt updated?")
-        return 0
+        return 2
 
     print(f"Checking certificate expiry for {host}:{port}")
     print(f"Pinned hashes ({len(all_pins)}): {', '.join(sorted(all_pins))}")
