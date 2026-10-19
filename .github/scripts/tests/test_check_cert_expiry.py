@@ -31,5 +31,27 @@ class NoPinsTest(unittest.TestCase):
         self.assertIn("::error::No pinned certificate hashes", out.getvalue())
 
 
+class FetchFailureTest(unittest.TestCase):
+    def test_fails_when_the_fetch_keeps_raising(self):
+        def raising_fetch(host, port):
+            raise OSError("network unreachable")
+
+        original_fetch = module.fetch_cert_chain
+        original_backoff = module.FETCH_BACKOFF_SECONDS
+        module.fetch_cert_chain = raising_fetch
+        module.FETCH_BACKOFF_SECONDS = 0
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                source = pathlib.Path(tmp, "CertificatePinning.kt")
+                source.write_text('val pins = listOf("sha256/AAAA")')
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    code = module.run("api.example.test", 443, 90, [], str(source))
+        finally:
+            module.fetch_cert_chain = original_fetch
+            module.FETCH_BACKOFF_SECONDS = original_backoff
+        self.assertNotEqual(code, 0)
+        self.assertIn("::error::Could not fetch the certificate chain", out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
