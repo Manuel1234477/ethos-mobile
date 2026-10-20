@@ -323,18 +323,22 @@ final class VaultStore: ObservableObject {
     @Published var sortOption: VaultSortOption = .expiryDate {
         didSet { saveSearchPreferences() }
     }
+    /// Issue #477: filter to vaults carrying this tag, or nil for no tag filter.
+    @Published var tagFilter: String?
 
     private var eventSocket: VaultEventSocket?
 
     /// Whether a further page is available for VaultListView's "Load More".
     var hasMorePages: Bool { nextCursor != nil }
 
-    /// Filtered and sorted vaults based on search text, status filter, and sort option
+    /// Filtered and sorted vaults based on search text, status filter, sort option,
+    /// and (#477) tag filter.
     var filteredAndSortedVaults: [Vault] {
         vaults
             .filter { vault in
                 statusFilter.matches(vault: vault) &&
-                (searchText.isEmpty || vault.id.lowercased().contains(searchText.lowercased()))
+                (searchText.isEmpty || vault.id.lowercased().contains(searchText.lowercased())) &&
+                (tagFilter == nil || VaultTagStore.tags(for: vault.id).contains(tagFilter!))
             }
             .sorted { lhs, rhs in
                 sortOption.compare(lhs: lhs, rhs: rhs)
