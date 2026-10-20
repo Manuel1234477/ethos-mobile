@@ -599,6 +599,10 @@ struct VaultListView: View {
                         NavigationLink(destination: SettingsView()) {
                             Label("Settings", systemImage: "gear")
                         }
+                        // Issue #474
+                        NavigationLink(destination: VaultMergeView()) {
+                            Label("Duplicate Vaults", systemImage: "arrow.triangle.merge")
+                        }
                         Button("Sign Out") { Task { await authStore.signOut() } }
                     } label: {
                         Image(systemName: "ellipsis.circle")
