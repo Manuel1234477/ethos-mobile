@@ -471,6 +471,7 @@ struct VaultListView: View {
     @EnvironmentObject var vaultStore: VaultStore
     @EnvironmentObject var authStore: AuthStore
     @State private var showCreate = false
+    @State private var showQRScanner = false // Issue #472
     @State private var showDeepLinkSheet = false
     @State private var showSettings = false
     @State private var showFilterMenu = false
@@ -588,6 +589,11 @@ struct VaultListView: View {
                     Button(action: { showCreate = true }) { Image(systemName: "plus") }
                         .accessibilityLabel("Create new vault")
                 }
+                ToolbarItem(placement: .primaryAction) {
+                    // Issue #472
+                    Button(action: { showQRScanner = true }) { Image(systemName: "qrcode.viewfinder") }
+                        .accessibilityLabel("Scan vault QR code")
+                }
                 ToolbarItem(placement: .secondaryAction) {
                     Menu {
                         NavigationLink(destination: SettingsView()) {
@@ -601,6 +607,7 @@ struct VaultListView: View {
             }
             .task { await vaultStore.load() }
             .sheet(isPresented: $showCreate) { CreateVaultView() }
+            .sheet(isPresented: $showQRScanner) { VaultQRScannerView() } // Issue #472
             .sheet(isPresented: $showDeepLinkSheet, onDismiss: { vaultStore.pendingDeepLink = nil }) {
                 if let link = vaultStore.pendingDeepLink {
                     DeepLinkView(link: link)
@@ -843,6 +850,10 @@ struct VaultDetailView: View {
                 }
                 if let ttl = ttlRemaining {
                     LabeledContent("TTL Remaining", value: formatDuration(ttl))
+                }
+                // Issue #472
+                NavigationLink(destination: VaultQRCodeView(vault: vault)) {
+                    Label("Share via QR Code", systemImage: "qrcode")
                 }
             }
 
