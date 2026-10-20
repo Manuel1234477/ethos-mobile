@@ -1,6 +1,7 @@
 package com.ethosprotocol
 
 import android.app.Application
+import android.content.ComponentCallbacks2
 import android.os.Handler
 import android.os.Looper
 import androidx.hilt.work.HiltWorkerFactory
@@ -69,5 +70,15 @@ class EthosProtocolApplication : Application(), Configuration.Provider {
         // events before the process is torn down (#426).
         sessionAnalytics.endSession()
         super.onTerminate()
+    }
+
+    // #486: React to system memory-pressure signals by dropping caches that are cheap
+    // to rebuild (icon/color lookups) rather than letting them hold memory the OS is
+    // explicitly asking back for the app not to be killed outright.
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) {
+            com.ethosprotocol.utils.AssetCache.clearCache()
+        }
     }
 }
