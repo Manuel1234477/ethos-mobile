@@ -467,6 +467,7 @@ final class VaultStore: ObservableObject {
             // overload — pin the reference to the original before calling it.
             let performCheckIn: (String, String?) async throws -> Void = APIClient.shared.checkIn(vaultID:idempotencyKey:)
             try await performCheckIn(vault.id, idempotencyKey)
+            VaultActionLog.record(.checkIn, for: vault.id) // #479
             if !Task.isCancelled { await load() }
         } catch APIError.networkUnavailable {
             // Offline: queue the check-in durably so it is retried when connectivity
@@ -491,6 +492,7 @@ final class VaultStore: ObservableObject {
         error = nil
         do {
             _ = try await APIClient.shared.deposit(vaultID: vault.id, amount: amount)
+            VaultActionLog.record(.deposit, for: vault.id) // #479
             if !Task.isCancelled { await load() }
         } catch {
             ifNotCancelled { self.error = ErrorPresentation(error) }
@@ -503,6 +505,7 @@ final class VaultStore: ObservableObject {
         error = nil
         do {
             _ = try await APIClient.shared.withdraw(vaultID: vault.id, amount: amount)
+            VaultActionLog.record(.withdraw, for: vault.id) // #479
             if !Task.isCancelled { await load() }
         } catch {
             ifNotCancelled { self.error = ErrorPresentation(error) }

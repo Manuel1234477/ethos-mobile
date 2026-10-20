@@ -983,9 +983,16 @@ struct VaultDetailView: View {
                 }
             }
 
+            // Issue #479: local action history and frequency stats.
+            Section {
+                NavigationLink(destination: VaultHistoryView(vault: vault)) {
+                    Label("Action History", systemImage: "clock.arrow.circlepath")
+                }
+            }
         }
         .navigationTitle("Vault")
         .navigationBarTitleDisplayMode(.inline)
+        .onAppear { VaultActionLog.record(.view, for: vault.id) }
         // `.task` auto-cancels when the view disappears, so this polling loop
         // (and the in-flight `getTTL` request it may be awaiting) stops cleanly
         // on navigating away instead of continuing to run in the background.
