@@ -17,7 +17,14 @@ data class WithdrawPayload(val vaultId: String, val amount: Long)
 @Keep
 @Entity(
     tableName = "pending_actions",
-    indices = [Index(value = ["dedupeKey"], unique = true)]
+    // #483: queuedAt is indexed because getAll() orders by it — without this,
+    // every call sorts the full table at query time instead of using the index.
+    // synced is indexed because the sync worker's cleanup path filters on it.
+    indices = [
+        Index(value = ["dedupeKey"], unique = true),
+        Index(value = ["queuedAt"]),
+        Index(value = ["synced"]),
+    ]
 )
 data class PendingAction(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
@@ -49,6 +56,11 @@ interface PendingActionDao {
 
     @Query("SELECT COUNT(*) FROM pending_actions")
     fun observeCount(): Flow<Int>
+
+    // #483: cheap existence/count check that doesn't pull every row's columns
+    // across the binder just to test emptiness (unlike getAll().isEmpty()).
+    @Query("SELECT COUNT(*) FROM pending_actions")
+    suspend fun count(): Int
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(item: PendingAction)

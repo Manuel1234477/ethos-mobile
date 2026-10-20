@@ -42,7 +42,11 @@ class PendingActionSyncWorker @AssistedInject constructor(
         val startMs = System.currentTimeMillis()
         val runAtIso = isoTimestamp(startMs)
 
-        val pending = compactConflicts(dao.getAll())
+        // #483: query execution time logging.
+        val getAllStartMs = System.currentTimeMillis()
+        val rawPending = dao.getAll()
+        Log.d(TAG, "dao.getAll() took ${System.currentTimeMillis() - getAllStartMs}ms, rows=${rawPending.size}")
+        val pending = compactConflicts(rawPending)
         if (pending.isEmpty()) {
             recordOutcome(runAtIso, succeeded = 0, failed = 0, retrying = false, queued = 0, lastModifiedAt = null)
             Log.i(TAG, "run finished — nothing to sync")
@@ -106,12 +110,14 @@ class PendingActionSyncWorker @AssistedInject constructor(
             }
         }
 
-        if (dao.getAll().isEmpty()) {
+        // #483: a single getAll() replaces what were two separate full-table queries
+        // back to back (one just to check emptiness, one for diagnostics).
+        val remaining = dao.getAll()
+        if (remaining.isEmpty()) {
             notificationHelper.cancelQueuedActions()
         }
 
         val willRetry = hasRetryableFailure
-        val remaining = dao.getAll()
         recordOutcome(
             runAtIso,
             succeeded,
