@@ -15,7 +15,12 @@ import Foundation
 /// channel, and a timestamp. Never balance, beneficiary, or any other vault
 /// field.
 struct NotificationDeliveryEvent: Codable, Equatable, Identifiable {
-    enum Kind: String, Codable { case scheduled, delivered, suppressed }
+    // Issue #473: tapped/dismissed/completed added for engagement analytics.
+    // `tapped` covers both the default tap and an action button (CHECK_IN_ACTION,
+    // snooze); `completed` is recorded separately only once the action a tap
+    // triggered actually succeeds (e.g. the check-in API call), so tap rate and
+    // completion rate are distinguishable.
+    enum Kind: String, Codable { case scheduled, delivered, suppressed, tapped, dismissed, completed }
     enum Source: String, Codable { case local, push, websocket }
 
     var id = UUID()
@@ -81,6 +86,37 @@ final class NotificationDeliveryLog {
                     && now.timeIntervalSince(event.timestamp) >= 0
             }
         }
+    }
+
+    /// Issue #473: engagement analytics, grouped by `eventType`
+    /// (e.g. "check_in_reminder", "ttl_warning").
+    struct EngagementStats {
+        let eventType: String
+        let delivered: Int
+        let tapped: Int
+        let dismissed: Int
+        let completed: Int
+
+        var tapRate: Double { delivered > 0 ? Double(tapped) / Double(delivered) : 0 }
+        var completionRate: Double { tapped > 0 ? Double(completed) / Double(tapped) : 0 }
+    }
+
+    /// Computes per-eventType engagement stats from the full logged history
+    /// (not just the most recent `maxEntries` the debug screen shows — this
+    /// reads the same bounded window, so stats reflect "recent activity",
+    /// not a lifetime total).
+    func engagementStats() -> [EngagementStats] {
+        let events = queue.sync { loadLocked() }
+        let grouped = Dictionary(grouping: events, by: \.eventType)
+        return grouped.map { eventType, events in
+            EngagementStats(
+                eventType: eventType,
+                delivered: events.filter { $0.kind == .delivered }.count,
+                tapped: events.filter { $0.kind == .tapped }.count,
+                dismissed: events.filter { $0.kind == .dismissed }.count,
+                completed: events.filter { $0.kind == .completed }.count
+            )
+        }.sorted { $0.delivered > $1.delivered }
     }
 
     private func loadLocked() -> [NotificationDeliveryEvent] {
