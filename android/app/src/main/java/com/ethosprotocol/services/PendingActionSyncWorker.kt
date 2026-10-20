@@ -13,6 +13,9 @@ import com.ethosprotocol.api.NetworkMonitor
 import com.ethosprotocol.models.CreateVaultRequest
 import dagger.assisted.Assisted
 import dagger.assisted.AssistedInject
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.serialization.json.Json
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -53,6 +56,7 @@ class PendingActionSyncWorker @AssistedInject constructor(
         var succeeded = 0
         var permanentlyFailed = 0
 
+        val toSync = mutableListOf<PendingAction>()
         for (item in pending) {
             if (item.synced) {
                 // The server already confirmed this action on a previous run, but the
@@ -61,17 +65,32 @@ class PendingActionSyncWorker @AssistedInject constructor(
                 // (it was already counted when it first succeeded).
                 dao.delete(item)
                 Log.i(TAG, "already-synced action cleaned up type=${item.type} vaultId=${item.vaultId}")
-                continue
+            } else {
+                toSync += item
             }
+        }
 
-            val result = when (item.type) {
-                PendingActionType.CHECK_IN -> apiClient.checkIn(item.vaultId!!, item.idempotencyKey)
-                PendingActionType.CREATE_VAULT ->
-                    apiClient.createVault(
-                        Json.decodeFromString<CreateVaultRequest>(item.payloadJson!!),
-                        item.idempotencyKey
-                    )
-            }
+        // #487: Dispatch all of this run's pending actions concurrently instead of one
+        // network round-trip at a time. compactConflicts() already resolved same-key
+        // (same vault+type) conflicts above, so the remaining actions have no ordering
+        // dependency on each other — only the per-item DAO/notification side effects
+        // below need to stay sequential, since they share hasRetryableFailure/counters.
+        val outcomes: List<Pair<PendingAction, ApiResult<*>>> = coroutineScope {
+            toSync.map { item ->
+                async {
+                    item to when (item.type) {
+                        PendingActionType.CHECK_IN -> apiClient.checkIn(item.vaultId!!, item.idempotencyKey)
+                        PendingActionType.CREATE_VAULT ->
+                            apiClient.createVault(
+                                Json.decodeFromString<CreateVaultRequest>(item.payloadJson!!),
+                                item.idempotencyKey
+                            )
+                    }
+                }
+            }.awaitAll()
+        }
+
+        for ((item, result) in outcomes) {
             when (result) {
                 is ApiResult.Success -> {
                     dao.markSynced(item.id)
