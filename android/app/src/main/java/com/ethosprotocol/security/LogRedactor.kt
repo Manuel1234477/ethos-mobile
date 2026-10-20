@@ -54,6 +54,27 @@ object LogRedactor {
     )
 
     /**
+     * Query parameter names whose values must be redacted when they appear in a
+     * URL or query string. Matching is case-insensitive.
+     */
+    private val SENSITIVE_QUERY_PARAMS: Set<String> = setOf(
+        "token",
+        "code",
+        "otp",
+        "secret",
+        "key"
+    )
+
+    /**
+     * Matches `name=value` pairs for the sensitive query parameters above. The
+     * value is captured up to the next `&`, `#`, whitespace, or end of string so
+     * that multi-parameter URLs are handled correctly.
+     */
+    private val QUERY_PARAM_REGEX = Regex(
+        pattern = """(?i)\b(token|code|otp|secret|key)=([^&#\s]*)"""
+    )
+
+    /**
      * Replaces known-sensitive patterns in [input] with safe placeholders:
      *
      * - `Bearer <token>` → `Bearer [REDACTED]`
@@ -62,6 +83,9 @@ object LogRedactor {
      * - `x-nonce: <value>` → `x-nonce: [REDACTED]`  (case-insensitive)
      *   Covers the anti-replay nonce header if it appears in a log string.
      *
+     * - `token=…`, `code=…`, `otp=…`, `secret=…`, `key=…` → `name=[REDACTED]`
+     *   Covers token-bearing query parameters embedded in logged URLs/paths.
+     *
      * @param input The raw string to sanitise.
      * @return A copy of [input] with sensitive patterns replaced.
      */
@@ -69,6 +93,14 @@ object LogRedactor {
         var result = BEARER_REGEX.replace(input, "Bearer [REDACTED]")
         result = NONCE_REGEX.replace(result) { match ->
             "${match.groupValues[1]}[REDACTED]"
+        }
+        result = QUERY_PARAM_REGEX.replace(result) { match ->
+            val name = match.groupValues[1]
+            if (SENSITIVE_QUERY_PARAMS.contains(name.lowercase())) {
+                "$name=[REDACTED]"
+            } else {
+                match.value
+            }
         }
         return result
     }
