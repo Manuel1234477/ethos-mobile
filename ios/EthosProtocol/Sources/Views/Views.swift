@@ -727,6 +727,13 @@ struct VaultRowView: View {
                     .foregroundStyle(.orange)
                     .lineLimit(1)
                     .minimumScaleFactor(0.8)
+            } else if vault.expiryRiskLevel() == .approaching {
+                // #480: predicted-expiry planning hint, one tier below the
+                // existing server-driven "expiring soon" banner.
+                Text("Predicted check-in deadline: \(vault.predictedExpiryDate.formatted(date: .abbreviated, time: .omitted))")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
         }
         .padding(.vertical, 4)
