@@ -314,13 +314,14 @@ jacoco {
 }
 
 tasks.withType<Test>().configureEach {
-    jacoco {
+    configure<JacocoTaskExtension> {
         isIncludeNoLocationClasses = true
+        excludes = listOf("jdk.internal.*")
     }
 }
 
-task<JacocoReport>("jacocoTestReport") {
-    dependsOn(tasks.testDebugUnitTest)
+tasks.register<JacocoReport>("jacocoTestReport") {
+    dependsOn(tasks.named("testDebugUnitTest"))
     group = "Coverage"
     description = "Generate JaCoCo coverage report for unit tests"
 
@@ -339,14 +340,14 @@ task<JacocoReport>("jacocoTestReport") {
 
     classDirectories.setFrom(
         files(
-            fileTree("${project.buildDir}/intermediates/classes/debug/"),
-            fileTree("${project.buildDir}/tmp/kotlin-classes/debug/")
+            fileTree(project.layout.buildDirectory.dir("intermediates/classes/debug/")),
+            fileTree(project.layout.buildDirectory.dir("tmp/kotlin-classes/debug/"))
         )
     )
 
     executionData.setFrom(
         files(
-            "${project.buildDir}/jacoco/testDebugUnitTest.exec"
+            project.layout.buildDirectory.file("jacoco/testDebugUnitTest.exec")
         )
     )
 }
