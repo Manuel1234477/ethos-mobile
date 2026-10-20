@@ -47,6 +47,39 @@ final class KeychainService {
         delete(forKey: tokenExpiryKey)
     }
 
+    // MARK: - Issue #476: per-account scoped token storage
+    //
+    // The "active" token/expiry (above) stays a single fixed slot so the rest
+    // of the app (AuthStore, APIClient, background refresh, the TTL widget)
+    // keeps reading/writing it exactly as before. These scoped variants let
+    // AccountManager archive an outgoing account's token before overwriting
+    // the active slot with an incoming account's, instead of discarding it.
+
+    func saveToken(_ token: String, expiresAt: Date?, accountId: String) {
+        save(token, forKey: scopedTokenKey(accountId), accessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly)
+        if let expiresAt {
+            save(String(expiresAt.timeIntervalSince1970), forKey: scopedTokenExpiryKey(accountId),
+                 accessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly)
+        }
+    }
+
+    func loadToken(accountId: String) -> String? {
+        load(forKey: scopedTokenKey(accountId))
+    }
+
+    func loadTokenExpiry(accountId: String) -> Date? {
+        guard let raw = load(forKey: scopedTokenExpiryKey(accountId)), let interval = TimeInterval(raw) else { return nil }
+        return Date(timeIntervalSince1970: interval)
+    }
+
+    func deleteToken(accountId: String) {
+        delete(forKey: scopedTokenKey(accountId))
+        delete(forKey: scopedTokenExpiryKey(accountId))
+    }
+
+    private func scopedTokenKey(_ accountId: String) -> String { "\(tokenKey).\(accountId)" }
+    private func scopedTokenExpiryKey(_ accountId: String) -> String { "\(tokenExpiryKey).\(accountId)" }
+
     func saveCredentialID(_ id: String) {
         save(id, forKey: credentialKey)
     }
