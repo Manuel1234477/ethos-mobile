@@ -31,6 +31,9 @@ object PasskeyRegistrationDiagnostics {
         val canOpenSettings: Boolean
     )
 
+    /** Maximum number of diagnostic entries retained; oldest entries are dropped first. */
+    const val MAX_EVENTS = 100
+
     private val eventLog: MutableList<Entry> = Collections.synchronizedList(mutableListOf())
 
     /**
@@ -39,7 +42,12 @@ object PasskeyRegistrationDiagnostics {
      * the ceremony failed before one was produced.
      */
     fun logFailure(authenticatorAttachment: String, attestationFormat: String?, reason: String, now: Long = System.currentTimeMillis()) {
-        eventLog.add(Entry(authenticatorAttachment, attestationFormat, reason, now))
+        synchronized(eventLog) {
+            eventLog.add(Entry(authenticatorAttachment, attestationFormat, reason, now))
+            while (eventLog.size > MAX_EVENTS) {
+                eventLog.removeAt(0)
+            }
+        }
     }
 
     /**
@@ -86,6 +94,6 @@ object PasskeyRegistrationDiagnostics {
     fun getLoggedEvents(): List<Entry> = synchronized(eventLog) { eventLog.toList() }
 
     fun clearLog() {
-        eventLog.clear()
+        synchronized(eventLog) { eventLog.clear() }
     }
 }

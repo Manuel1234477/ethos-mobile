@@ -1,15 +1,17 @@
 package com.ethosprotocol.api
 
 import com.ethosprotocol.BuildConfig
-import java.util.Collections
 
 object ApiDebugLog {
-    private val entries = Collections.synchronizedList(mutableListOf<String>())
+    private val lock = Any()
+    private val entries = ArrayDeque<String>()
 
     fun record(method: String, path: String, status: Int) {
         if (!BuildConfig.DEBUG) return
-        entries += "${System.currentTimeMillis()} $method $path $status"
-        while (entries.size > 100) entries.removeAt(0)
+        synchronized(lock) {
+            entries.addLast("${System.currentTimeMillis()} $method $path $status")
+            while (entries.size > 100) entries.removeFirst()
+        }
     }
 
     fun recordSecurityHeaders(method: String, path: String, headers: Map<String, String>) {
@@ -17,10 +19,12 @@ object ApiDebugLog {
         val issues = validateSecurityHeaders(headers)
         if (issues.isEmpty()) return
         val timestamp = System.currentTimeMillis()
-        for (issue in issues) {
-            entries += "$timestamp SECURITY $method $path $issue"
+        synchronized(lock) {
+            for (issue in issues) {
+                entries.addLast("$timestamp SECURITY $method $path $issue")
+            }
+            while (entries.size > 100) entries.removeFirst()
         }
-        while (entries.size > 100) entries.removeAt(0)
     }
 
     fun validateSecurityHeaders(headers: Map<String, String>): List<String> {
@@ -67,5 +71,5 @@ object ApiDebugLog {
         }
     }
 
-    fun snapshot(): List<String> = synchronized(entries) { entries.toList() }
+    fun snapshot(): List<String> = synchronized(lock) { entries.toList() }
 }
