@@ -295,7 +295,9 @@ final class SessionsStore: ObservableObject {
 
 @MainActor
 final class VaultStore: ObservableObject {
-    @Published var vaults: [Vault] = []
+    @Published var vaults: [Vault] = [] {
+        didSet { recomputeFilteredAndSortedVaults() }
+    }
     @Published var isLoading = false
     @Published var isLoadingMore = false
     @Published var error: ErrorPresentation?
@@ -313,15 +315,24 @@ final class VaultStore: ObservableObject {
     @Published private(set) var lastSyncTime: Date?
     /// Search text for filtering vaults by ID/name
     @Published var searchText: String = "" {
-        didSet { saveSearchPreferences() }
+        didSet {
+            saveSearchPreferences()
+            if searchText != oldValue { recomputeFilteredAndSortedVaults() }
+        }
     }
     /// Status filter for vault list (Healthy, Expiring Soon, etc.)
     @Published var statusFilter: VaultStatusFilter = .all {
-        didSet { saveSearchPreferences() }
+        didSet {
+            saveSearchPreferences()
+            if statusFilter != oldValue { recomputeFilteredAndSortedVaults() }
+        }
     }
     /// Sort option for vault list (by expiry, name, creation date)
     @Published var sortOption: VaultSortOption = .expiryDate {
-        didSet { saveSearchPreferences() }
+        didSet {
+            saveSearchPreferences()
+            if sortOption != oldValue { recomputeFilteredAndSortedVaults() }
+        }
     }
 
     private var eventSocket: VaultEventSocket?
@@ -329,9 +340,18 @@ final class VaultStore: ObservableObject {
     /// Whether a further page is available for VaultListView's "Load More".
     var hasMorePages: Bool { nextCursor != nil }
 
-    /// Filtered and sorted vaults based on search text, status filter, and sort option
-    var filteredAndSortedVaults: [Vault] {
-        vaults
+    /// Filtered and sorted vaults based on search text, status filter, and sort option.
+    ///
+    /// #481: cached rather than computed on every access. SwiftUI re-evaluates the
+    /// view body (and therefore re-reads this property) on *any* `@Published` change
+    /// on this object, including ones unrelated to the list contents (isLoading,
+    /// socketConnectionState, etc). Recomputing an O(n log n) filter+sort pass over
+    /// the full vault list on every such change was the actual bottleneck with large
+    /// lists — SwiftUI's `List` itself already virtualizes rendering correctly.
+    @Published private(set) var filteredAndSortedVaults: [Vault] = []
+
+    private func recomputeFilteredAndSortedVaults() {
+        filteredAndSortedVaults = vaults
             .filter { vault in
                 statusFilter.matches(vault: vault) &&
                 (searchText.isEmpty || vault.id.lowercased().contains(searchText.lowercased()))
