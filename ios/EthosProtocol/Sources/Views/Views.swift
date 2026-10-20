@@ -603,6 +603,10 @@ struct VaultListView: View {
                         NavigationLink(destination: VaultMergeView()) {
                             Label("Duplicate Vaults", systemImage: "arrow.triangle.merge")
                         }
+                        // Issue #475
+                        NavigationLink(destination: VaultExpiryTrendsView()) {
+                            Label("Expiry Trends", systemImage: "chart.bar")
+                        }
                         Button("Sign Out") { Task { await authStore.signOut() } }
                     } label: {
                         Image(systemName: "ellipsis.circle")
