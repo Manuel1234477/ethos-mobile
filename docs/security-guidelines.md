@@ -599,7 +599,13 @@ are not a disclosure list — if you find something new, report it per
 | `X-Request-Signature` | Not in the shared contract; Android-only; signs too little and keys with the bearer token | §3.5 |
 | `user.id` | Derived from the username on both platforms rather than an opaque handle | §3.1 |
 | Request signature / redaction | Redaction list is hand-maintained and does not cover every contract header | §4.1 |
-| Room database | `pending_actions.db` stores vault IDs and amounts unencrypted | §2.2 |
+
+The pending-action store (`pending_actions.db`) is **no longer** a known gap. It is
+encrypted at rest with SQLCipher, using a passphrase held in the Android Keystore
+(via `EncryptedSharedPreferences` / the existing `MasterKey`), and the existing
+plaintext database is migrated on first launch. `android:allowBackup="false"` plus
+`res/xml/backup_rules.xml` continue to exclude the database from backups. See §2.2
+and §5.4.
 
 ---
 

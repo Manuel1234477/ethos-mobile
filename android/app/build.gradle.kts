@@ -200,6 +200,14 @@ android {
         }
     }
 
+    // #611: Room schema export. Room's KSP processor writes the generated schema JSON for
+    // every @Database version into $projectDir/schemas (committed to VCS), and the
+    // androidTest source set reads them back as assets so MigrationTestHelper can validate
+    // each version step against the real, historical schemas.
+    sourceSets {
+        getByName("androidTest").assets.srcDir("$projectDir/schemas")
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -215,6 +223,12 @@ android {
             "-opt-in=androidx.compose.material3.ExperimentalMaterial3Api",
         )
     }
+}
+
+// #611: Point Room's schema export at a committed directory so the generated JSON is
+// available to MigrationTestHelper in androidTest (see the androidTest assets srcDir above).
+ksp {
+    arg("room.schemaLocation", "$projectDir/schemas")
 }
 
 dependencies {

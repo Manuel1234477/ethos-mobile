@@ -284,7 +284,7 @@ class ApiClient(
                 kotlinx.serialization.serializer(),
                 body
             ).toByteArray(Charsets.UTF_8)
-            val response = client.post("$baseUrl$path") {
+            var response = client.post("$baseUrl$path") {
                 standardHeaders()
                 bearerAuth()
                 antiReplayHeaders(HttpMethod.Post, path, bodyBytes, idempotencyKey)
@@ -292,6 +292,19 @@ class ApiClient(
                 setBody(bodyBytes)
             }
             ApiCompressionMetrics.record(response)
+            // #609: documented recovery for `replay_detected` (docs/api-error-codes.md) —
+            // regenerate X-Nonce/X-Timestamp and retry the mutation exactly once. The
+            // idempotency key is intentionally kept stable across the retry.
+            if (response.isReplayDetected()) {
+                response = client.post("$baseUrl$path") {
+                    standardHeaders()
+                    bearerAuth()
+                    antiReplayHeaders(HttpMethod.Post, path, bodyBytes, idempotencyKey)
+                    contentType(ContentType.Application.Json)
+                    setBody(bodyBytes)
+                }
+                ApiCompressionMetrics.record(response)
+            }
             val result = when (response.status.value) {
                 in 200..299 -> ApiResult.Success(if (T::class == Unit::class) Unit as T else response.body())
                 // #211: a 401 can carry a human-readable reason in its body (e.g. an expired
@@ -323,7 +336,7 @@ class ApiClient(
                 kotlinx.serialization.serializer(),
                 body
             ).toByteArray(Charsets.UTF_8)
-            val response = client.delete("$baseUrl$path") {
+            var response = client.delete("$baseUrl$path") {
                 standardHeaders()
                 bearerAuth()
                 antiReplayHeaders(HttpMethod.Delete, path, bodyBytes)
@@ -331,6 +344,18 @@ class ApiClient(
                 setBody(bodyBytes)
             }
             ApiCompressionMetrics.record(response)
+            // #609: documented recovery for `replay_detected` (docs/api-error-codes.md) —
+            // regenerate X-Nonce/X-Timestamp and retry the mutation exactly once.
+            if (response.isReplayDetected()) {
+                response = client.delete("$baseUrl$path") {
+                    standardHeaders()
+                    bearerAuth()
+                    antiReplayHeaders(HttpMethod.Delete, path, bodyBytes)
+                    contentType(ContentType.Application.Json)
+                    setBody(bodyBytes)
+                }
+                ApiCompressionMetrics.record(response)
+            }
             // Ktor does not throw on non-2xx responses by default, so the status must be
             // checked explicitly here (as get()/post() already do) — otherwise a failed
             // deletion (401/500/etc.) is silently reported back to callers as success.
@@ -408,6 +433,16 @@ class ApiClient(
         val retryAfter = headers[HttpHeaders.RetryAfter]
         return if (retryAfter.isNullOrBlank()) "Rate limited. Please retry later."
             else "Rate limited. Retry after $retryAfter seconds."
+    }
+
+    // #609: detects the documented `{"error": "replay_detected"}` body on HTTP 400/403
+    // (see docs/api-error-codes.md). Used by post()/delete() to regenerate the anti-replay
+    // headers and retry a mutating request once. GETs are idempotent and never retried here.
+    private suspend fun HttpResponse.isReplayDetected(): Boolean {
+        if (status.value != 400 && status.value != 403) return false
+        return runCatching {
+            Json.decodeFromString<Map<String, String>>(bodyAsText())["error"] == "replay_detected"
+        }.getOrDefault(false)
     }
 
     private fun isRetryableNetworkError(e: Throwable): Boolean =
