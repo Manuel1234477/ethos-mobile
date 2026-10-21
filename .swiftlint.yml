@@ -1,0 +1,18 @@
+disabled_rules:
+  - trailing_whitespace
+  - todo
+
+opt_in_rules:
+  - empty_count
+  - explicit_init
+  - force_unwrapping
+  - private_outlet
+  - redundant_nil_coalescing
+
+custom_rules:
+  no_raw_print:
+    name: "No Raw print()"
+    regex: '\bprint\s*\('
+    included: "Sources"
+    message: "Use a DEBUG-gated logger routed through LogRedactor instead of raw print()."
+    severity: warning
