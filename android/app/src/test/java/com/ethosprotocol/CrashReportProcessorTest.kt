@@ -309,4 +309,108 @@ class CrashReportProcessorTest {
         assertEquals(1, all.size)
         assertEquals(fresh.id, all.first().id)
     }
+
+    // ---------- #634 logging behaviour ----------
+
+    /**
+     * Helper that builds a processor wired to an in-memory log sink so tests can
+     * inspect log output without Robolectric or mockkStatic(Log::class).
+     */
+    private fun processorWithLogCapture(
+        isDebug: Boolean,
+        logLines: MutableList<String>
+    ): CrashReportProcessor {
+        val context: Context = mockk(relaxed = true)
+        every { context.getSharedPreferences(any<String>(), any()) } returns fakeSharedPreferences()
+        return CrashReportProcessor(context, isDebug = isDebug, logSink = { logLines += it })
+    }
+
+    @Test
+    fun `release build logs only exception type and crash ID — no raw message`() {
+        val logged = mutableListOf<String>()
+        val proc = processorWithLogCapture(isDebug = false, logLines = logged)
+        val report = makeReport(message = "Bearer eyJhbGciOiJIUzI1NiJ9.secret")
+
+        proc.ingest(report)
+
+        assertEquals("expected exactly one log line", 1, logged.size)
+        val line = logged[0]
+        assertFalse("raw exceptionMessage must not appear in release log", line.contains("Bearer"))
+        assertFalse("raw exceptionMessage must not appear in release log", line.contains("secret"))
+        assertTrue("log must contain exceptionType", line.contains(report.exceptionType))
+        assertTrue("log must contain crash ID", line.contains(report.id))
+    }
+
+    @Test
+    fun `debug build logs exception type, redacted message, and crash ID`() {
+        val logged = mutableListOf<String>()
+        val proc = processorWithLogCapture(isDebug = true, logLines = logged)
+        val sensitiveMessage = "Bearer eyJhbGciOiJIUzI1NiJ9.secret token leaked here"
+        val report = makeReport(message = sensitiveMessage)
+
+        proc.ingest(report)
+
+        assertEquals("expected exactly one log line", 1, logged.size)
+        val line = logged[0]
+        // Token value must be redacted by LogRedactor
+        assertFalse("raw Bearer token must be redacted in debug log", line.contains("eyJhbGciOiJIUzI1NiJ9.secret"))
+        assertTrue("redacted placeholder must appear", line.contains("[REDACTED]"))
+        assertTrue("log must contain exceptionType", line.contains(report.exceptionType))
+        assertTrue("log must contain crash ID", line.contains(report.id))
+    }
+
+    @Test
+    fun `release build critical alert logs only exception type and crash ID — no raw message`() {
+        val logged = mutableListOf<String>()
+        val proc = processorWithLogCapture(isDebug = false, logLines = logged)
+        // CRITICAL severity triggers alertCritical() in addition to the ingest log
+        val report = makeReport(
+            severity = CrashSeverity.CRITICAL,
+            type = "OutOfMemoryError",
+            message = "Authorization: Bearer top-secret-token"
+        )
+
+        proc.ingest(report)
+
+        // Two lines: one from ingest(), one from alertCritical()
+        assertEquals("expected ingest + alertCritical log lines", 2, logged.size)
+        for (line in logged) {
+            assertFalse("raw token must never appear in release log: $line", line.contains("top-secret-token"))
+            assertTrue("crash ID must appear in every line: $line", line.contains(report.id))
+        }
+    }
+
+    @Test
+    fun `debug build critical alert redacts Bearer token in message`() {
+        val logged = mutableListOf<String>()
+        val proc = processorWithLogCapture(isDebug = true, logLines = logged)
+        val report = makeReport(
+            severity = CrashSeverity.CRITICAL,
+            type = "OutOfMemoryError",
+            message = "Bearer abc123.secret"
+        )
+
+        proc.ingest(report)
+
+        assertEquals("expected ingest + alertCritical log lines", 2, logged.size)
+        for (line in logged) {
+            assertFalse("raw token value must be redacted in debug log: $line", line.contains("abc123.secret"))
+        }
+    }
+
+    @Test
+    fun `release build does not log exceptionMessage even when it contains no known patterns`() {
+        val logged = mutableListOf<String>()
+        val proc = processorWithLogCapture(isDebug = false, logLines = logged)
+        val sensitivePlainText = "userId=abc-def-ghi requestBody={token:xyz}"
+        val report = makeReport(message = sensitivePlainText)
+
+        proc.ingest(report)
+
+        assertEquals(1, logged.size)
+        assertFalse(
+            "exceptionMessage must not appear at all in release log regardless of content",
+            logged[0].contains(sensitivePlainText)
+        )
+    }
 }

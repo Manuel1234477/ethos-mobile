@@ -1,6 +1,7 @@
 package com.ethosprotocol.api
 
 import kotlin.random.Random
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 
 // Retry configuration for idempotent network calls. ApiClient applies this only
@@ -38,6 +39,10 @@ suspend fun <T> withRetry(
         try {
             return operation()
         } catch (e: Throwable) {
+            // Cancellation must always propagate: retrying it would break structured
+            // concurrency (the cancelled coroutine would keep sleeping and re-running
+            // the operation), even if the caller's predicate accepts every error.
+            if (e is CancellationException) throw e
             attempt++
             if (attempt >= policy.maxAttempts || !isRetryable(e)) throw e
             val maxDelayMillis = (policy.baseDelayMillis * (1L shl (attempt - 1))).coerceAtMost(policy.maxDelayMillis)

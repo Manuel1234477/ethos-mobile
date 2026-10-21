@@ -94,3 +94,43 @@ object NetworkQualityDetector {
     fun resolve(context: Context, preference: QualityPreference): NetworkQualityTier =
         preference.resolve(detect(context))
 }
+
+/**
+ * A vault as returned by the server.
+ *
+ * [version] is a server-assigned, monotonically increasing revision used to
+ * reconcile out-of-order updates (see shared/api-contract.md §Reconciling, #223
+ * and #606). When comparing two snapshots of the same vault, the one with the
+ * higher [version] is newer and must win; a snapshot with a lower or equal
+ * version must be discarded rather than applied.
+ *
+ * Older servers that do not yet emit a version field are treated as
+ * [DEFAULT_VERSION], which is lower than any version a versioned server will
+ * assign. This keeps backward compatibility: an unversioned snapshot will never
+ * overwrite a versioned one, and among unversioned snapshots the last-applied
+ * value is retained.
+ */
+data class Vault(
+    val id: String,
+    val name: String,
+    val version: Long = DEFAULT_VERSION
+) {
+    companion object {
+        /**
+         * Version assigned to vaults from servers that do not report a version.
+         * Chosen as the minimum possible revision so that any real server-assigned
+         * version supersedes it.
+         */
+        const val DEFAULT_VERSION: Long = 0L
+    }
+
+    /**
+     * Returns true if this snapshot is strictly newer than [other] and should
+     * therefore be applied over it. Equal versions are considered not newer so
+     * that the already-applied state is preserved (last-applied-wins for ties).
+     */
+    fun isNewerThan(other: Vault?): Boolean {
+        if (other == null) return true
+        return version > other.version
+    }
+}

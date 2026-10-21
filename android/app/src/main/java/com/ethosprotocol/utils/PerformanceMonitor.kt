@@ -1,6 +1,7 @@
 package com.ethosprotocol.utils
 
 import android.util.Log
+import com.ethosprotocol.BuildConfig
 import com.google.firebase.perf.FirebasePerformance
 import com.google.firebase.perf.metrics.Trace
 import java.util.concurrent.CopyOnWriteArrayList
@@ -126,9 +127,10 @@ object PerformanceMonitor {
         }
 
         if (durationMs > PerformanceThresholds.API_SLOW_MS) {
-            Log.w(TAG, "Slow API call: $method $path took ${durationMs}ms " +
+            val label = if (BuildConfig.DEBUG) "$method $path" else "$method ${toPathTemplate(path)}"
+            Log.w(TAG, "Slow API call: $label took ${durationMs}ms " +
                 "(threshold=${PerformanceThresholds.API_SLOW_MS}ms) status=$statusCode")
-        } else {
+        } else if (BuildConfig.DEBUG) {
             Log.d(TAG, "API call: $method $path = ${durationMs}ms status=$statusCode")
         }
     }
@@ -164,6 +166,35 @@ object PerformanceMonitor {
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
+
+    /**
+     * Replaces concrete path segments (UUIDs, opaque IDs) and query strings with
+     * placeholder tokens so the result is safe to log in release builds.
+     *
+     * Rules applied in order:
+     *  1. Strip everything from '?' onward (query params may carry cursors / PII).
+     *  2. Replace any path segment that is ≥ 8 chars **and contains at least one digit**
+     *     with `{id}`. Requiring a digit preserves known API sub-resource words
+     *     (`challenge`, `sessions`, `initiate`, `beneficiary`, `trust-device`, …) which
+     *     are all purely alphabetic, while still catching UUIDs, numeric IDs, and the
+     *     mixed alphanumeric tokens the server issues.
+     *
+     * Examples:
+     *   "/vaults/abc12345/checkin"                         → "/vaults/{id}/checkin"
+     *   "/auth/sessions/550e8400-e29b-41d4-a716-…"        → "/auth/sessions/{id}"
+     *   "/vaults/abc12345/2fa/backup-codes/generate"      → "/vaults/{id}/2fa/backup-codes/generate"
+     *   "/vaults?limit=20&after=opaqueCursor9999"          → "/vaults"
+     *   "/auth/challenge"                                  → "/auth/challenge"  (unchanged)
+     */
+    internal fun toPathTemplate(path: String): String {
+        // 1. Drop query string
+        val noQuery = path.substringBefore('?')
+        // 2. Replace segments that look like opaque IDs (≥ 8 chars, contains a digit)
+        return noQuery.replace(Regex("/([A-Za-z0-9_-]{8,})(?=/|$)")) { match ->
+            val segment = match.groupValues[1]
+            if (segment.any { it.isDigit() }) "/{id}" else match.value
+        }
+    }
 
     /**
      * Returns the [p]-th percentile value (0–100) of a sorted copy of this list.

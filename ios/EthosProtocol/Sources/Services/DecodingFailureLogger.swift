@@ -11,12 +11,32 @@ final class DecodingFailureLogger {
     private var eventLog: [DecodingFailureEntry] = []
     private let queue = DispatchQueue(label: "com.ethos-protocol.decoding-failure-logger", attributes: .concurrent)
 
-    /// JSON keys (case-insensitive) whose values are replaced with "[REDACTED]"
-    /// before a response body is logged.
-    private static let sensitiveKeys: Set<String> = [
-        "token", "credential_id", "public_key", "client_data_json", "signature",
-        "secret", "otp", "password", "authorization", "provisioning_uri"
+    /// Maximum number of entries retained in `eventLog`; older entries are
+    /// dropped so a repeatedly failing endpoint can't grow the log unbounded
+    /// (#628, mirroring Android's `NotificationDeliveryLog`).
+    static let maxEntries = 100
+
+    /// Substrings (matched case-insensitively against JSON keys) whose values
+    /// are replaced with "[REDACTED]" before a response body is logged.
+    ///
+    /// Substring matching (rather than an exact-key set) ensures compound keys
+    /// such as `access_token`, `refresh_token`, `totp_secret`, and
+    /// `recovery_token` are redacted too (#625).
+    ///
+    /// The contract-listed fields — `amount`, `balance`, `beneficiary`, `owner`,
+    /// `address`, and `acceptance_token` — are sourced from
+    /// `shared/api-contract.md` §Logging Redaction Policy (#626).
+    private static let sensitiveKeyPatterns: [String] = [
+        "token", "secret", "otp", "password", "key",
+        "amount", "balance", "beneficiary", "owner", "address", "acceptance_token"
     ]
+
+    /// Returns `true` when `key` names a sensitive field whose value must be
+    /// redacted before logging.
+    static func isSensitiveKey(_ key: String) -> Bool {
+        let lowered = key.lowercased()
+        return sensitiveKeyPatterns.contains { lowered.contains($0) }
+    }
 
     /// Logs a decode failure for `path` where a `expectedType` was expected but
     /// couldn't be decoded from `responseBody`.
@@ -25,6 +45,7 @@ final class DecodingFailureLogger {
     /// being stored, ensuring that any token or nonce embedded in a query string
     /// is stripped even when the URL is used as the log key.
     func log(path: String, expectedType: String, responseBody: Data) {
+        #if DEBUG
         let entry = DecodingFailureEntry(
             path: LogRedactor.redactString(path),
             expectedType: expectedType,
@@ -33,7 +54,11 @@ final class DecodingFailureLogger {
         )
         queue.async(flags: .barrier) {
             self.eventLog.append(entry)
+            if self.eventLog.count > Self.maxEntries {
+                self.eventLog.removeFirst(self.eventLog.count - Self.maxEntries)
+            }
         }
+        #endif
     }
 
     /// Retrieves all logged events
@@ -71,7 +96,7 @@ final class DecodingFailureLogger {
         if let dict = value as? [String: Any] {
             var result: [String: Any] = [:]
             for (key, v) in dict {
-                result[key] = sensitiveKeys.contains(key.lowercased()) ? "[REDACTED]" : redactValue(v)
+                result[key] = isSensitiveKey(key) ? "[REDACTED]" : redactValue(v)
             }
             return result
         } else if let array = value as? [Any] {

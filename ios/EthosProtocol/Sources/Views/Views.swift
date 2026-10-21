@@ -262,7 +262,7 @@ struct CopyableIDView: View {
     }
 
     private func copyToClipboard() {
-        UIPasteboard.general.string = fullID
+        SensitiveClipboard.copy(fullID)
         showCopiedFeedback = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             showCopiedFeedback = false
@@ -471,6 +471,7 @@ struct VaultListView: View {
     @EnvironmentObject var vaultStore: VaultStore
     @EnvironmentObject var authStore: AuthStore
     @State private var showCreate = false
+    @State private var showQRScanner = false // Issue #472
     @State private var showDeepLinkSheet = false
     @State private var showSettings = false
     @State private var showFilterMenu = false
@@ -609,10 +610,23 @@ struct VaultListView: View {
                     Button(action: { showCreate = true }) { Image(systemName: "plus") }
                         .accessibilityLabel("Create new vault")
                 }
+                ToolbarItem(placement: .primaryAction) {
+                    // Issue #472
+                    Button(action: { showQRScanner = true }) { Image(systemName: "qrcode.viewfinder") }
+                        .accessibilityLabel("Scan vault QR code")
+                }
                 ToolbarItem(placement: .secondaryAction) {
                     Menu {
                         NavigationLink(destination: SettingsView()) {
                             Label("Settings", systemImage: "gear")
+                        }
+                        // Issue #474
+                        NavigationLink(destination: VaultMergeView()) {
+                            Label("Duplicate Vaults", systemImage: "arrow.triangle.merge")
+                        }
+                        // Issue #475
+                        NavigationLink(destination: VaultExpiryTrendsView()) {
+                            Label("Expiry Trends", systemImage: "chart.bar")
                         }
                         Button("Sign Out") { Task { await authStore.signOut() } }
                     } label: {
@@ -622,6 +636,7 @@ struct VaultListView: View {
             }
             .task { await vaultStore.load() }
             .sheet(isPresented: $showCreate) { CreateVaultView() }
+            .sheet(isPresented: $showQRScanner) { VaultQRScannerView() } // Issue #472
             .sheet(isPresented: $showDeepLinkSheet, onDismiss: { vaultStore.pendingDeepLink = nil }) {
                 if let link = vaultStore.pendingDeepLink {
                     DeepLinkView(link: link)
@@ -754,6 +769,13 @@ struct VaultRowView: View {
                     .foregroundStyle(.orange)
                     .lineLimit(1)
                     .minimumScaleFactor(0.8)
+            } else if vault.expiryRiskLevel() == .approaching {
+                // #480: predicted-expiry planning hint, one tier below the
+                // existing server-driven "expiring soon" banner.
+                Text("Predicted check-in deadline: \(vault.predictedExpiryDate.formatted(date: .abbreviated, time: .omitted))")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
             if !tags.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
@@ -907,6 +929,10 @@ struct VaultDetailView: View {
                 }
                 if let ttl = ttlRemaining {
                     LabeledContent("TTL Remaining", value: formatDuration(ttl))
+                }
+                // Issue #472
+                NavigationLink(destination: VaultQRCodeView(vault: vault)) {
+                    Label("Share via QR Code", systemImage: "qrcode")
                 }
             }
 
@@ -1738,7 +1764,7 @@ struct TwoFactorVerifyView: View {
                 }
                 .padding(.horizontal)
             }
-            Button(action: { UIPasteboard.general.string = backupCodes.joined(separator: "\n") }) {
+            Button(action: { SensitiveClipboard.copy(backupCodes.joined(separator: "\n")) }) {
                 Label("Copy All Codes", systemImage: "doc.on.doc").frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)

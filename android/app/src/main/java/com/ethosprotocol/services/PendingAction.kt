@@ -17,7 +17,14 @@ data class WithdrawPayload(val vaultId: String, val amount: Long)
 @Keep
 @Entity(
     tableName = "pending_actions",
-    indices = [Index(value = ["dedupeKey"], unique = true)]
+    // #483: queuedAt is indexed because getAll() orders by it — without this,
+    // every call sorts the full table at query time instead of using the index.
+    // synced is indexed because the sync worker's cleanup path filters on it.
+    indices = [
+        Index(value = ["dedupeKey"], unique = true),
+        Index(value = ["queuedAt"]),
+        Index(value = ["synced"]),
+    ]
 )
 data class PendingAction(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
@@ -39,7 +46,11 @@ data class PendingAction(
     // deleted. If the process dies in that window, the next run sees synced == true and
     // knows this row already succeeded — it just finishes the delete without resubmitting
     // the request or double-counting it in sync diagnostics.
-    val synced: Boolean = false
+    val synced: Boolean = false,
+    // Set when a row is found to be malformed (e.g. a required field is null after a
+    // migration or partial write). Dead-lettered rows are skipped by the sync worker so a
+    // single bad row cannot block the rest of the queue on every run.
+    val deadLetter: Boolean = false
 )
 
 @Dao
@@ -50,6 +61,11 @@ interface PendingActionDao {
     @Query("SELECT COUNT(*) FROM pending_actions")
     fun observeCount(): Flow<Int>
 
+    // #483: cheap existence/count check that doesn't pull every row's columns
+    // across the binder just to test emptiness (unlike getAll().isEmpty()).
+    @Query("SELECT COUNT(*) FROM pending_actions")
+    suspend fun count(): Int
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(item: PendingAction)
 
@@ -58,6 +74,9 @@ interface PendingActionDao {
 
     @Query("UPDATE pending_actions SET synced = 1 WHERE id = :id")
     suspend fun markSynced(id: Long)
+
+    @Query("UPDATE pending_actions SET deadLetter = 1 WHERE id = :id")
+    suspend fun markDeadLetter(id: Long)
 
     @Query("DELETE FROM pending_actions")
     suspend fun deleteAll()

@@ -3,6 +3,8 @@ package com.ethosprotocol.services
 import android.content.Context
 import android.content.SharedPreferences
 import android.util.Log
+import com.ethosprotocol.BuildConfig
+import com.ethosprotocol.security.LogRedactor
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -50,7 +52,20 @@ data class CrashDashboardSummary(
  * - MEDIUM   : IOException, NetworkException
  * - LOW      : everything else
  */
-class CrashReportProcessor(private val context: Context) {
+class CrashReportProcessor(
+    private val context: Context,
+    /** Overridable in tests; defaults to [BuildConfig.DEBUG] in production. */
+    private val isDebug: Boolean = BuildConfig.DEBUG,
+    /**
+     * Sink for log messages produced by [ingest] and [alertCritical]. Defaults to
+     * no-op; override in tests to capture log output without Robolectric or
+     * `mockkStatic(Log::class)`. Each call receives the full formatted log line.
+     *
+     * #634: Having an injectable sink keeps the logging contract testable without
+     * any Android runtime dependency.
+     */
+    internal val logSink: (String) -> Unit = {}
+) {
 
     private val tag = "CrashReportProcessor"
     private val prefsName = "ethos_crash_reports"
@@ -68,7 +83,18 @@ class CrashReportProcessor(private val context: Context) {
         reports.add(0, report) // newest first
         val trimmed = reports.take(maxReports)
         saveReports(trimmed)
-        Log.e(tag, "Crash ingested: [${report.severity}] ${report.exceptionType}: ${report.exceptionMessage}")
+        // #634: Never log raw exceptionMessage in release — it can contain tokens,
+        // request bodies, or user data. In debug, redact known-sensitive patterns first.
+        if (isDebug) {
+            val safeMessage = LogRedactor.redactString(report.exceptionMessage)
+            val line = "Crash ingested: [${report.severity}] ${report.exceptionType}: $safeMessage (id=${report.id})"
+            Log.e(tag, line)
+            logSink(line)
+        } else {
+            val line = "Crash ingested: [${report.severity}] ${report.exceptionType} (id=${report.id})"
+            Log.e(tag, line)
+            logSink(line)
+        }
         if (report.severity == CrashSeverity.CRITICAL) {
             alertCritical(report)
         }
@@ -181,7 +207,17 @@ class CrashReportProcessor(private val context: Context) {
      * integrating PagerDuty / push alerting.
      */
     private fun alertCritical(report: CrashReport) {
-        Log.wtf(tag, "CRITICAL CRASH ALERT: ${report.exceptionType} — ${report.exceptionMessage}")
+        // #634: Same rule as ingest() — raw exceptionMessage is suppressed in release.
+        if (isDebug) {
+            val safeMessage = LogRedactor.redactString(report.exceptionMessage)
+            val line = "CRITICAL CRASH ALERT: ${report.exceptionType} — $safeMessage (id=${report.id})"
+            Log.wtf(tag, line)
+            logSink(line)
+        } else {
+            val line = "CRITICAL CRASH ALERT: ${report.exceptionType} (id=${report.id})"
+            Log.wtf(tag, line)
+            logSink(line)
+        }
         // TODO(#470): wire to PagerDuty / on-call push alert pathway.
     }
 

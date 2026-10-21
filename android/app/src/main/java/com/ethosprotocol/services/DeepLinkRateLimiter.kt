@@ -2,6 +2,7 @@ package com.ethosprotocol.services
 
 import androidx.lifecycle.SavedStateHandle
 import android.util.Log
+import com.ethosprotocol.BuildConfig
 
 /**
  * Client-side rate limiting for deep-link-triggered API calls.
@@ -43,7 +44,7 @@ object DeepLinkRateLimiter {
         }
         
         val remainingMs = MIN_CALL_INTERVAL_MS - (now - lastCallMs)
-        Log.d(TAG, "Rate limit enforced for vault $vaultId: retry after ${remainingMs}ms")
+        if (BuildConfig.DEBUG) Log.d(TAG, "Rate limit enforced for vault $vaultId: retry after ${remainingMs}ms")
         return false
     }
 
