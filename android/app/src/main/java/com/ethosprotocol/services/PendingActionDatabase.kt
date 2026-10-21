@@ -7,6 +7,7 @@ import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
+// #483: version 3 adds indices on queuedAt and synced.
 @Database(entities = [PendingAction::class], version = 3, exportSchema = false)
 abstract class PendingActionDatabase : RoomDatabase() {
     abstract fun pendingActionDao(): PendingActionDao
@@ -34,12 +35,32 @@ abstract class PendingActionDatabase : RoomDatabase() {
         }
 
         /**
+         * Explicit migration from v2 to v3.
+         *
+         * v3 adds indices on `queuedAt` and `synced` so the sync worker's queries stay fast as
+         * the queue grows (#483). These must match the [PendingAction] entity definition.
+         */
+        val MIGRATION_2_3: Migration = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_pending_actions_queuedAt` " +
+                        "ON `pending_actions` (`queuedAt`)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_pending_actions_synced` " +
+                        "ON `pending_actions` (`synced`)"
+                )
+            }
+        }
+
+        /**
          * All explicit migrations, in order. When the database version is bumped, add a new
          * [Migration] here (e.g. `MIGRATION_2_3`) and register it in [create]. Never rely on
          * destructive fallback for release builds: queued actions are unsynced user intentions.
          */
         private val ALL_MIGRATIONS: Array<Migration> = arrayOf(
-            MIGRATION_1_2
+            MIGRATION_1_2,
+            MIGRATION_2_3
         )
 
         fun create(context: Context): PendingActionDatabase =

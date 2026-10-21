@@ -869,8 +869,10 @@ class VaultViewModel @Inject constructor(
 
     private suspend fun queueAction(action: PendingAction) {
         pendingActionDao.insert(action)
-        val queued = pendingActionDao.getAll()
-        notificationHelper.showQueuedActions(queued.size)
+        // #483: count() instead of getAll().size — avoids pulling every queued
+        // row's full columns across the binder just to show a badge count.
+        val queuedCount = pendingActionDao.count()
+        notificationHelper.showQueuedActions(queuedCount)
         PendingActionSyncWorker.schedule(context)
         _state.update { it.copy(error = "Offline — request queued and will retry automatically") }
     }

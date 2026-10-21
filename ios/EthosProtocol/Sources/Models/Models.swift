@@ -78,6 +78,38 @@ public struct Vault: Codable, Identifiable, Equatable {
         return ttl < 86_400 // < 24 hours
     }
 
+    /// Issue #480: predicted check-in deadline, computed from `lastCheckIn` +
+    /// `checkInInterval` when the server hasn't supplied a fresher `ttlRemaining`
+    /// snapshot. This is a deterministic projection of the existing rule (the
+    /// vault releases to the beneficiary if the owner doesn't check in within
+    /// `checkInInterval` of `lastCheckIn`), not a statistical forecast — there is
+    /// no hidden uncertainty to model here, only a date arithmetic the UI wasn't
+    /// previously surfacing directly.
+    public var predictedExpiryDate: Date {
+        if let ttl = ttlRemaining {
+            return Date().addingTimeInterval(TimeInterval(ttl))
+        }
+        return lastCheckIn.addingTimeInterval(TimeInterval(checkInInterval))
+    }
+
+    public enum ExpiryRiskLevel: String {
+        case safe, approaching, critical
+    }
+
+    /// Issue #480: a simple planning signal — what fraction of the check-in
+    /// window has elapsed since the last check-in, bucketed into three tiers.
+    /// This is a heuristic on the existing deterministic deadline, not a
+    /// learned model of user behavior (that would need historical check-in
+    /// timing data this client doesn't currently retain).
+    public func expiryRiskLevel(asOf now: Date = Date()) -> ExpiryRiskLevel {
+        guard checkInInterval > 0 else { return .safe }
+        let elapsed = now.timeIntervalSince(lastCheckIn)
+        let fractionElapsed = elapsed / TimeInterval(checkInInterval)
+        if fractionElapsed >= 0.9 { return .critical }
+        if fractionElapsed >= 0.7 { return .approaching }
+        return .safe
+    }
+
     /// Formats `balance` (stroops) in `assetCode`. Assumes the 7-decimal stroop
     /// scale that applies to every Stellar classic asset regardless of code —
     /// only the unit label varies (#222).
