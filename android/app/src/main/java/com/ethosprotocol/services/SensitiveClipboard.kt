@@ -48,11 +48,23 @@ object SensitiveClipboard {
         clearJob?.cancel()
         clearJob = scope.launch {
             delay(CLEAR_DELAY_SECONDS * 1_000L)
-            // Clear by overwriting with an empty string — the label indicates
-            // this was intentionally cleared so clipboard history tools can
-            // optionally suppress it.
-            val clearClip = ClipData.newPlainText("Cleared", "")
-            clipboard.setPrimaryClip(clearClip)
+            // Only clear if the clipboard still holds the value we wrote — if the
+            // user has copied something else during the window, leave it alone.
+            val current = clipboard.primaryClip?.getItemAt(0)?.text?.toString()
+            if (shouldClear(current, value)) {
+                // Clear by overwriting with an empty string — the label indicates
+                // this was intentionally cleared so clipboard history tools can
+                // optionally suppress it.
+                val clearClip = ClipData.newPlainText("Cleared", "")
+                clipboard.setPrimaryClip(clearClip)
+            }
         }
     }
+
+    /**
+     * Returns true only when the clipboard still holds [copiedValue], so the
+     * auto-clear never deletes content the user copied after the sensitive value.
+     */
+    internal fun shouldClear(currentClip: String?, copiedValue: String): Boolean =
+        currentClip == copiedValue
 }
