@@ -5,6 +5,10 @@ on:
   release:
     types: [published]
 
+# Read-only by default. A job that needs more scope must say so itself.
+permissions:
+  contents: read
+
 jobs:
   validate-parity-gap-claims:
     runs-on: ubuntu-latest

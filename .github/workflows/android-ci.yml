@@ -10,6 +10,10 @@ defaults:
   run:
     working-directory: android
 
+# Read-only by default. A job that needs more scope must say so itself.
+permissions:
+  contents: read
+
 jobs:
   # Kept out of build-and-test: the OWASP dependency-check task calls the NVD
   # API, which has no key configured here and rate-limits (HTTP 429) under

@@ -79,9 +79,11 @@ export default function () {
       socket.setTimeout(() => socket.close(), 5000);
     });
 
-    check(res, { "reconnected": () => connected });
     attempt++;
   }
+
+  // `connected` is set only when the socket opens, so this checks the handshake outcome.
+  check(connected, { "reconnected": (ok) => ok === true });
 
   if (connected) {
     reconnectLatency.add(Date.now() - disconnectedAt);

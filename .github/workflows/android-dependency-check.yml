@@ -120,20 +120,42 @@ jobs:
         uses: actions/github-script@v9
         with:
           script: |
-            await github.rest.issues.create({
+            const title = "⚠️ Android dependency-check failed (scheduled scan)";
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            // Repeated failures add a comment to the open alert instead of a new duplicate issue.
+            const open = await github.paginate(github.rest.issues.listForRepo, {
               owner: context.repo.owner,
-              repo:  context.repo.repo,
-              title: "⚠️ Android dependency-check failed (scheduled scan)",
-              body: [
-                "The weekly Android dependency vulnerability scan failed.",
-                "",
-                "This may mean a dependency now has a known CVSS >= 7.0 vulnerability, or the",
-                "scan itself failed for an unrelated reason (see the run log).",
-                "",
-                `Workflow run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-                "",
-                "Related: #178 (moved this job off the per-PR trigger after it repeatedly",
-                "hung for 1h+ without an NVD API key and got killed by the runner)."
-              ].join("\n"),
-              labels: ["security", "android", "ci"]
+              repo: context.repo.repo,
+              state: "open",
+              labels: "security,android,ci",
             });
+            const existing = open.find((issue) => issue.title === title);
+
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body: `Scheduled scan failed again: ${runUrl}`,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                title,
+                body: [
+                  "The weekly Android dependency vulnerability scan failed.",
+                  "",
+                  "This may mean a dependency now has a known CVSS >= 7.0 vulnerability, or the",
+                  "scan itself failed for an unrelated reason (see the run log).",
+                  "",
+                  `Workflow run: ${runUrl}`,
+                  "",
+                  "Related: #178 (moved this job off the per-PR trigger after it repeatedly",
+                  "hung for 1h+ without an NVD API key and got killed by the runner)."
+                ].join("
+"),
+                labels: ["security", "android", "ci"]
+              });
+            }

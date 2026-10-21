@@ -23,6 +23,10 @@ defaults:
   run:
     working-directory: .
 
+# Read-only by default. A job that needs more scope must say so itself.
+permissions:
+  contents: read
+
 jobs:
   check-cert-expiry:
     name: Check Pinned Certificate Expiry

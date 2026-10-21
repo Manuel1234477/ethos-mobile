@@ -10,6 +10,10 @@ defaults:
   run:
     working-directory: ios/EthosProtocol
 
+# Read-only by default. A job that needs more scope must say so itself.
+permissions:
+  contents: read
+
 jobs:
   build-and-test:
     runs-on: macos-latest
@@ -361,3 +365,16 @@ jobs:
             -only-testing:EthosProtocolUITests \
             -skipMacroValidation \
             -resultBundlePath ui-test-results.xcresult
+
+  # Guards the ui-tests continue-on-error exemption (#574). The exemption is dated here and
+  # this job fails once that date has passed, so it cannot stay in place without a decision.
+  ui-tests-exemption-expiry:
+    name: ui-tests exemption expiry
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail once the ui-tests exemption expires
+        run: |
+          if [ "$(date -u +%F)" > "2026-12-31" ]; then
+            echo "::error::ui-tests has continue-on-error set and its expiry (2026-12-31) has passed. Make the job blocking."
+            exit 1
+          fi

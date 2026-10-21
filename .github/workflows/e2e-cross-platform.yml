@@ -30,6 +30,10 @@ env:
   # setting the E2E_API_BASE_URL repository secret.
   E2E_API_BASE_URL: ${{ inputs.staging_api_url || secrets.E2E_API_BASE_URL || 'https://staging.ethos-protocol.app' }}
 
+# Read-only by default. A job that needs more scope must say so itself.
+permissions:
+  contents: read
+
 jobs:
   # ---------------------------------------------------------------------------
   # 1. Verify the staging API is reachable before spending simulator time.
