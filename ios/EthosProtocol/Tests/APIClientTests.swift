@@ -428,6 +428,168 @@ final class APIClientAuthTests: XCTestCase {
     }
 }
 
+// MARK: - #598 Vault ID Path Encoding Tests
+
+final class APIClientVaultIDEncodingTests: XCTestCase {
+
+    var client: APIClient!
+
+    override func setUpWithError() throws {
+        super.setUp()
+        MockURLProtocol.reset()
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockURLProtocol.self]
+        let session = URLSession(configuration: config)
+        client = APIClient.makeTestInstance(session: session)
+    }
+
+    override func tearDownWithError() throws {
+        MockURLProtocol.reset()
+        super.tearDown()
+    }
+
+    /// IDs that must never be able to escape their path segment.
+    private let hostileIDs: [(id: String, encoded: String)] = [
+        ("vault?x=1", "vault%3Fx=1"),
+        ("vault#frag", "vault%23frag"),
+        ("vault/other", "vault%2Fother"),
+        ("vault%2Fother", "vault%252Fother"),
+    ]
+
+    /// Asserts the last request's URL has exactly the expected path and no query/fragment.
+    private func assertLastRequestPath(_ expectedPath: String, file: StaticString = #filePath, line: UInt = #line) {
+        guard let url = MockURLProtocol.requestedURLs.last else {
+            XCTFail("No request was recorded", file: file, line: line)
+            return
+        }
+        XCTAssertEqual(url.path, expectedPath, "Unexpected path for \(url.absoluteString)", file: file, line: line)
+        XCTAssertNil(url.query, "ID must not introduce a query component: \(url.absoluteString)", file: file, line: line)
+        XCTAssertNil(url.fragment, "ID must not introduce a fragment component: \(url.absoluteString)", file: file, line: line)
+    }
+
+    func test_getVault_percentEncodesHostileIDs() async throws {
+        for (id, encoded) in hostileIDs {
+            MockURLProtocol.reset()
+            let expectedPath = "/v1/vaults/\(encoded)"
+            let expectedURL = "https://api.ethos-protocol.app\(expectedPath)"
+            let response = HTTPURLResponse(url: URL(string: expectedURL)!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+            let body = """
+            {"id": "\(id.replacingOccurrences(of: "\"", with: ""))", "owner": "GABC", "beneficiary": "GXYZ", "balance": 100000000, "check_in_interval": 2592000, "last_check_in": "2026-01-01T00:00:00Z", "ttl_remaining": 1000000, "status": "active"}
+            """.data(using: .utf8)!
+            MockURLProtocol.mockResponses[expectedURL] = (data: body, response: response)
+
+            _ = try await client.getVault(id: id)
+
+            assertLastRequestPath(expectedPath)
+        }
+    }
+
+    func test_checkIn_percentEncodesHostileIDs() async throws {
+        for (id, encoded) in hostileIDs {
+            MockURLProtocol.reset()
+            let expectedPath = "/v1/vaults/\(encoded)/checkin"
+            let expectedURL = "https://api.ethos-protocol.app\(expectedPath)"
+            let response = HTTPURLResponse(url: URL(string: expectedURL)!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+            MockURLProtocol.mockResponses[expectedURL] = (data: Data("{}".utf8), response: response)
+
+            _ = try await client.checkIn(vaultID: id)
+
+            assertLastRequestPath(expectedPath)
+        }
+    }
+
+    func test_deleteVault_percentEncodesHostileIDs() async throws {
+        for (id, encoded) in hostileIDs {
+            MockURLProtocol.reset()
+            let expectedPath = "/v1/vaults/\(encoded)"
+            let expectedURL = "https://api.ethos-protocol.app\(expectedPath)"
+            let response = HTTPURLResponse(url: URL(string: expectedURL)!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+            MockURLProtocol.mockResponses[expectedURL] = (data: Data(), response: response)
+
+            try await client.deleteVault(id: id)
+
+            assertLastRequestPath(expectedPath)
+        }
+    }
+}
+
+// MARK: - #599 Pagination Limit Clamping Tests
+
+final class APIClientPaginationLimitTests: XCTestCase {
+
+    var client: APIClient!
+
+    override func setUpWithError() throws {
+        super.setUp()
+        MockURLProtocol.reset()
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockURLProtocol.self]
+        let session = URLSession(configuration: config)
+        client = APIClient.makeTestInstance(session: session)
+    }
+
+    override func tearDownWithError() throws {
+        MockURLProtocol.reset()
+        super.tearDown()
+    }
+
+    private func limitQueryValue(from url: URL) -> Int? {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
+        return components.queryItems?
+            .first(where: { $0.name == "limit" })?
+            .value
+            .flatMap(Int.init)
+    }
+
+    func test_vaultsQueryItems_clampsLimitToContractRange() {
+        let cases: [(input: Int, expected: Int)] = [
+            (-100, 1),
+            (-1, 1),
+            (0, 1),
+            (1, 1),
+            (50, 50),
+            (100, 100),
+            (101, 100),
+            (1000, 100),
+        ]
+
+        for (input, expected) in cases {
+            let items = APIClient.vaultsQueryItems(cursor: nil, limit: input)
+            let limitValue = items.first(where: { $0.name == "limit" })?.value.flatMap(Int.init)
+            XCTAssertEqual(limitValue, expected, "limit \(input) should be clamped to \(expected)")
+        }
+    }
+
+    func test_listVaults_clampsLimitToContractRange() async throws {
+        let cases: [(input: Int, expected: Int)] = [
+            (-100, 1),
+            (-1, 1),
+            (0, 1),
+            (1, 1),
+            (100, 100),
+            (101, 100),
+            (1000, 100),
+        ]
+
+        for (input, expected) in cases {
+            MockURLProtocol.reset()
+            let expectedURL = "https://api.ethos-protocol.app/v1/vaults?limit=\(expected)"
+            let response = HTTPURLResponse(url: URL(string: expectedURL)!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+            MockURLProtocol.mockResponses[expectedURL] = (data: Data("[]".utf8), response: response)
+
+            _ = try await client.listVaults(limit: input)
+
+            guard let url = MockURLProtocol.requestedURLs.last else {
+                XCTFail("No request recorded for limit \(input)")
+                continue
+            }
+            XCTAssertEqual(limitQueryValue(from: url), expected, "limit \(input) should be clamped to \(expected)")
+        }
+    }
+}
+
 // MARK: - #604 listAllVaults Pagination Guard Tests
 
 final class APIClientListAllVaultsPaginationTests: XCTestCase {

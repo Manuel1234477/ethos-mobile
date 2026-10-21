@@ -9,21 +9,26 @@ import com.ethosprotocol.models.AuthToken
 import io.ktor.client.engine.mock.MockEngine
 import io.ktor.client.engine.mock.respond
 import io.ktor.http.HttpHeaders
-import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.headersOf
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.verify
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.yield
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
@@ -247,6 +252,147 @@ class ApiClientTest {
         )
     }
 
+    // #597: IDs must be validated at the boundary and percent-encoded in request paths.
+
+    @Test
+    fun `vault IDs containing path or query metacharacters are rejected`() = runTest {
+        every { tokenProvider.token } returns "good-token"
+        every { tokenProvider.isNearExpiry() } returns false
+
+        val engine = MockEngine {
+            respond(
+                content = "{}",
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, "application/json")
+            )
+        }
+        val apiClient = ApiClient(tokenProvider, networkMonitor, offlineCache, "https://test", engine)
+
+        val badIds = listOf("abc/def", "abc?x=1", "..", "../other", "abc%2Fdef", "abc#frag", "abc def")
+        for (badId in badIds) {
+            try {
+                apiClient.getVault(badId)
+                fail("Expected IllegalArgumentException for vault id '$badId'")
+            } catch (e: IllegalArgumentException) {
+                // expected
+            }
+            try {
+                apiClient.checkIn(badId, com.ethosprotocol.models.CheckInRequest(proof = "p"))
+                fail("Expected IllegalArgumentException for vault id '$badId'")
+            } catch (e: IllegalArgumentException) {
+                // expected
+            }
+        }
+    }
+
+    @Test
+    fun `valid vault ID is percent-encoded as a single path segment`() = runTest {
+        every { tokenProvider.token } returns "good-token"
+        every { tokenProvider.isNearExpiry() } returns false
+
+        val observedPaths = mutableListOf<String>()
+        val engine = MockEngine { request ->
+            observedPaths.add(request.url.encodedPath)
+            respond(
+                content = "{}",
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, "application/json")
+            )
+        }
+        val apiClient = ApiClient(tokenProvider, networkMonitor, offlineCache, "https://test", engine)
+
+        // A valid ID that still requires encoding (space is not a path/query metacharacter
+        // but must be percent-encoded so it cannot alter the target endpoint).
+        val vaultId = "vault 1"
+        apiClient.getVault(vaultId)
+
+        assertEquals(1, observedPaths.size)
+        assertEquals("/vaults/vault%201", observedPaths[0])
+    }
+
+    // #599: limit must be clamped to the contract's 1..100 range.
+
+    @Test
+    fun `listVaults clamps limit to the 1 to 100 range`() = runTest {
+        every { tokenProvider.token } returns "good-token"
+        every { tokenProvider.isNearExpiry() } returns false
+
+        val observedLimits = mutableListOf<String?>()
+        val engine = MockEngine { request ->
+            observedLimits.add(request.url.parameters["limit"])
+            respond(
+                content = "[]",
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, "application/json")
+            )
+        }
+        val apiClient = ApiClient(tokenProvider, networkMonitor, offlineCache, "https://test", engine)
+
+        apiClient.listVaults(limit = 0)
+        apiClient.listVaults(limit = 1)
+        apiClient.listVaults(limit = 100)
+        apiClient.listVaults(limit = 101)
+        apiClient.listVaults(limit = -5)
+        apiClient.listVaults(limit = 1000)
+
+        assertEquals(listOf("1", "1", "100", "100", "1", "100"), observedLimits)
+    }
+
+    // #600: a cancelled leader must not propagate CancellationException to followers.
+
+    @Test
+    fun `cancelled single-flight leader does not cancel the follower`() = runTest {
+        every { tokenProvider.token } returns "good-token"
+        every { tokenProvider.isNearExpiry() } returns false
+
+        val firstRequestStarted = CompletableDeferred<Unit>()
+        var requestCount = 0
+        val engine = MockEngine {
+            requestCount++
+            if (requestCount == 1) {
+                firstRequestStarted.complete(Unit)
+                // Suspend until the leader is cancelled.
+                kotlinx.coroutines.awaitCancellation()
+            }
+            respond(
+                content = "[]",
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, "application/json")
+            )
+        }
+        val apiClient = ApiClient(tokenProvider, networkMonitor, offlineCache, "https://test", engine)
+
+        val leader = launch { apiClient.listVaults() }
+        firstRequestStarted.await()
+
+        val follower = async { apiClient.listVaults() }
+        // Let the follower join the in-flight request.
+        yield()
+
+        leader.cancelAndJoin()
+
+        val result = try {
+            follower.await()
+        } catch (e: CancellationException) {
+            fail("Follower received CancellationException from the cancelled leader: $e")
+            return@runTest
+        }
+
+        assertNotNull(result)
+        assertTrue("Follower should still receive a successful result, got $result", result is ApiResult.Success)
+    }
+
+    // #592: pinning must fail closed. If the platform TrustManager cannot be obtained,
+    // engine construction must throw rather than silently running without pinning.
+    @Test
+    fun `null system TrustManager fails closed instead of skipping pinning`() {
+        val failure = assertThrows(IllegalStateException::class.java) {
+            ApiClient.sslManager(systemTm = null)
+        }
+
+        assertTrue(failure.message.orEmpty().contains("TrustManager"))
+    }
+
     // #607: the signing key must be derived from the server-issued session secret,
     // never from the bearer token that already travels on every request.
     @Test
@@ -348,16 +494,5 @@ class ApiClientTest {
     private fun sha256Hex(data: String): String {
         val digest = java.security.MessageDigest.getInstance("SHA-256")
         return digest.digest(data.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
-    }
-
-    // #592: pinning must fail closed. If the platform TrustManager cannot be obtained,
-    // engine construction must throw rather than silently running without pinning.
-    @Test
-    fun `null system TrustManager fails closed instead of skipping pinning`() {
-        val failure = assertThrows(IllegalStateException::class.java) {
-            ApiClient.sslManager(systemTm = null)
-        }
-
-        assertTrue(failure.message.orEmpty().contains("TrustManager"))
     }
 }
