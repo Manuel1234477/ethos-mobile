@@ -130,6 +130,17 @@ android {
         }
     }
 
+    // #631: Register the custom lint detector (UnguardedVaultIdLog) so it actually runs
+    // during `lint`/`lintDebug`/`lintRelease`. The detector lives in the :lint module and
+    // is wired in via `lintChecks` below; the rule itself is enabled in lint.xml.
+    lint {
+        // Fail the build on the vault-ID logging violation so it can't regress silently.
+        // (Severity is defined by the detector; this just ensures it's treated as an error.)
+        abortOnError = true
+        // Keep the existing lint behavior for everything else intact.
+        checkReleaseBuilds = true
+    }
+
     signingConfigs {
         if (hasReleaseSigningConfig) {
             create("release") {
@@ -206,6 +217,13 @@ android {
     }
 }
 
+dependencies {
+    // #631: Custom lint detector (UnguardedVaultIdLog) that flags unguarded vaultId in
+    // Log.* calls. `lintChecks` makes the detector run as part of this module's lint
+    // tasks without packaging it into the app. The rule is enabled in lint.xml.
+    lintChecks(project(":lint"))
+}
+
 // JUnit pulls in org.hamcrest:hamcrest-core:1.3, which espresso-core (transitively required
 // by compose-ui-test-junit4's Robolectric idling support) is incompatible with
 // ("NoSuchMethodError: AllOf.allOf(Matcher, Matcher)") — 1.3's org.hamcrest.core.AllOf lacks
@@ -245,5 +263,3 @@ configurations.all {
         //  CVE-2026-48006/48043/48059, CVE-2026-50010/50011/50020/50560,
         //  CVE-2026-55831/55833/55851, CVE-2026-56745/56746/56817/56819-56822,
         //  CVE-2026-59898-59901/5
-
-/* … truncated 6345 chars — edit only what you need near the top … */
