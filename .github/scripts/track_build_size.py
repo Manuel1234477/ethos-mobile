@@ -56,6 +56,17 @@ def track_android_size(base_size_mb=None):
     return size_mb
 
 
+def path_size_bytes(path):
+    """Size in bytes of a file, or of every file under a directory."""
+    if os.path.isfile(path):
+        return os.path.getsize(path)
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            total += os.path.getsize(os.path.join(root, name))
+    return total
+
+
 def track_ios_size(base_size_mb=None):
     """Measure iOS IPA size and compare to base."""
     # IPA is built as an archive in a temp directory; find it
@@ -90,22 +101,8 @@ def track_ios_size(base_size_mb=None):
 
     # Calculate directory size
     try:
-        result = subprocess.run(
-            ["du", "-sh", ipa_path],
-            capture_output=True,
-            text=True
-        )
-        size_str = result.stdout.split()[0]
-        # Convert to MB
-        if size_str.endswith("M"):
-            size_mb = float(size_str[:-1])
-        elif size_str.endswith("G"):
-            size_mb = float(size_str[:-1]) * 1024
-        elif size_str.endswith("K"):
-            size_mb = float(size_str[:-1]) / 1024
-        else:
-            size_mb = float(size_str)
-    except (subprocess.CalledProcessError, ValueError):
+        size_mb = path_size_bytes(ipa_path) / (1024 * 1024)
+    except OSError:
         print("::warning::Could not measure iOS app size")
         return None
 
