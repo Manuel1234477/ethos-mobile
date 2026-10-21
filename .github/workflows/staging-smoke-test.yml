@@ -24,7 +24,7 @@ jobs:
     name: Smoke test staging (auth, list vaults, check-in)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Run staging smoke tests
         env:

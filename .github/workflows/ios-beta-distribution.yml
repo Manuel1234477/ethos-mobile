@@ -76,7 +76,7 @@ jobs:
       expiry_days: ${{ steps.beta_dist.outputs.expiry_days }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Full history + tags: release notes are generated from commits since
           # the previous vX.Y.Z tag.

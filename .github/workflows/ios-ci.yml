@@ -14,7 +14,7 @@ jobs:
   build-and-test:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Runs before any Xcode toolchain/build work: this only needs the
       # checked-out sources (the script itself + the target Info.plists),
@@ -96,7 +96,7 @@ jobs:
       - name: Review dependency changes for high severity vulnerabilities
         if: github.event_name == 'pull_request'
         continue-on-error: true
-        uses: actions/dependency-review-action@v4
+        uses: actions/dependency-review-action@v5
         # Non-blocking: dependency-review requires the Dependency graph feature
         # to be enabled in repo settings (Settings → Security → Code security).
         # If it is disabled the action errors with "not supported on this
@@ -296,7 +296,7 @@ jobs:
       run:
         working-directory: ios/EthosProtocol
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode.app

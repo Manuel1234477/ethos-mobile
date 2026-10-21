@@ -44,10 +44,10 @@ jobs:
       run:
         working-directory: android
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "17"
@@ -84,7 +84,7 @@ jobs:
           echo "Staging APK: $APK ($(numfmt --to=iec $SIZE))"
 
       - name: Upload staging APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: android-staging-apk
           path: android/app/build/outputs/apk/staging/
@@ -99,7 +99,7 @@ jobs:
       run:
         working-directory: ios/EthosProtocol
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode.app
