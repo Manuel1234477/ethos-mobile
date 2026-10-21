@@ -262,7 +262,7 @@ struct CopyableIDView: View {
     }
 
     private func copyToClipboard() {
-        UIPasteboard.general.string = fullID
+        SensitiveClipboard.copy(fullID)
         showCopiedFeedback = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             showCopiedFeedback = false
