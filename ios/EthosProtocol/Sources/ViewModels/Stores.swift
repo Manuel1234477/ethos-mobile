@@ -343,14 +343,26 @@ final class VaultStore: ObservableObject {
 
     /// Filtered and sorted vaults based on search text, status filter, and sort option
     var filteredAndSortedVaults: [Vault] {
-        vaults
+        // Issue #474: vaults merged away into another vault are hidden from
+        // the main list — they still exist and VaultMergeStore can un-merge
+        // them, but they no longer clutter the primary view.
+        let hidden = VaultMergeStore.hiddenVaultIds()
+        return vaults
             .filter { vault in
+                !hidden.contains(vault.id) &&
                 statusFilter.matches(vault: vault) &&
                 (searchText.isEmpty || vault.id.lowercased().contains(searchText.lowercased()))
             }
             .sorted { lhs, rhs in
                 sortOption.compare(lhs: lhs, rhs: rhs)
             }
+    }
+
+    /// Issue #474: duplicate-vault groups (same beneficiary, different vault
+    /// IDs), excluding any pair where one side has already been merged away.
+    var duplicateGroups: [VaultDuplicateGroup] {
+        let hidden = VaultMergeStore.hiddenVaultIds()
+        return VaultDuplicateDetector.findDuplicateGroups(in: vaults.filter { !hidden.contains($0.id) })
     }
 
     init() {

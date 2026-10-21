@@ -224,7 +224,18 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                  didReceive response: UNNotificationResponse,
                                  withCompletionHandler completionHandler: @escaping () -> Void) {
-        let vaultID = response.notification.request.content.userInfo["vault_id"] as? String
+        let content = response.notification.request.content
+        let vaultID = content.userInfo["vault_id"] as? String
+        // Issue #473: the same eventType derivation willPresent uses, so tap/
+        // dismiss events group under the same key as scheduled/delivered ones.
+        let eventType = (content.userInfo["type"] as? String) ?? content.categoryIdentifier
+        let source: NotificationDeliveryEvent.Source = content.userInfo["type"] != nil ? .push : .local
+
+        if response.actionIdentifier == UNNotificationDismissActionIdentifier {
+            NotificationDeliveryLog.shared.record(kind: .dismissed, source: source, eventType: eventType, vaultID: vaultID ?? "unknown")
+        } else {
+            NotificationDeliveryLog.shared.record(kind: .tapped, source: source, eventType: eventType, vaultID: vaultID ?? "unknown")
+        }
 
         switch response.actionIdentifier {
         case "CHECK_IN_ACTION":
@@ -233,7 +244,17 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
             // throwing/Void signature and the CheckInSyncTask.APIClientProtocol conformance's
             // overload — pin the reference to the original before calling it.
             let performCheckIn: (String, String?) async throws -> Void = APIClient.shared.checkIn(vaultID:idempotencyKey:)
-            Task { try? await performCheckIn(id, nil) }
+            Task {
+                do {
+                    try await performCheckIn(id, nil)
+                    // Issue #473: recorded only on success, separately from the
+                    // tap above, so tap rate and completion rate are distinguishable.
+                    NotificationDeliveryLog.shared.record(kind: .completed, source: source, eventType: eventType, vaultID: id)
+                } catch {
+                    // Swallowed deliberately (pre-existing behavior): a failed
+                    // tap-to-check-in has no UI to surface an error to here.
+                }
+            }
 
         case "SNOOZE_7_DAYS":
             rescheduleNotificationReminder(forVaultID: vaultID, delaySeconds: 7 * 24 * 3_600)
@@ -299,8 +320,12 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
         // (resetting the vault's TTL) straight from the lock screen banner, bypassing the
         // BiometricService confirmation that guards the equivalent in-app action.
         let checkInAction = UNNotificationAction(identifier: "CHECK_IN_ACTION", title: LocalizedStrings.checkInAction, options: [.foreground, .authenticationRequired])
+        // Issue #473: .customDismissAction is required for a plain swipe-to-dismiss
+        // to actually invoke didReceive(response:) at all — without it, iOS doesn't
+        // report dismissals to the delegate, so dismissal tracking would silently
+        // never fire no matter what the delegate method itself did.
         let category = UNNotificationCategory(identifier: "CHECK_IN", actions: [checkInAction],
-                                               intentIdentifiers: [], options: [])
+                                               intentIdentifiers: [], options: [.customDismissAction])
         UNUserNotificationCenter.current().setNotificationCategories([category])
     }
 }
