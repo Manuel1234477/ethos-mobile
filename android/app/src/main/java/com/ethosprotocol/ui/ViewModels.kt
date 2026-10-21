@@ -581,6 +581,12 @@ data class VaultUiState(
 
 private const val PAGE_SIZE = 20
 
+// #486: Upper bound on how many vaults loadAll() will hold in memory at once. A user
+// with an unusually large number of vaults shouldn't balloon the app's heap just to
+// populate the list — this cap is generous enough to only trim extreme cases.
+private const val MAX_CACHED_VAULTS = 500
+private const val VAULT_VM_TAG = "VaultViewModel"
+
 @HiltViewModel
 class VaultViewModel @Inject constructor(
     private val apiClient: ApiClient,
@@ -711,6 +717,13 @@ class VaultViewModel @Inject constructor(
             when (val result = apiClient.listVaults(limit = limit, after = cursor)) {
                 is ApiResult.Success -> {
                     accumulated.addAll(result.data.vaults)
+                    // #486: Trim from the front once the cap is exceeded instead of letting
+                    // every subsequent page grow the list unbounded.
+                    if (accumulated.size > MAX_CACHED_VAULTS) {
+                        Log.w(VAULT_VM_TAG, "loadAll: ${accumulated.size} vaults exceeds cap " +
+                            "$MAX_CACHED_VAULTS — trimming oldest entries")
+                        while (accumulated.size > MAX_CACHED_VAULTS) accumulated.removeAt(0)
+                    }
                     cursor = result.data.nextCursor
                     if (!result.data.hasMore) {
                         _state.update { it.copy(vaults = accumulated, isLoading = false, isOffline = false) }
