@@ -120,6 +120,69 @@ final class KeychainServiceHostedTests: XCTestCase {
     }
 }
 
+// MARK: - #619 Salted PIN KDF Tests with Real Host
+
+final class KeychainServicePINKDFHostedTests: XCTestCase {
+
+    override func setUp() {
+        super.setUp()
+        KeychainService.shared.deletePINHash()
+    }
+
+    override func tearDown() {
+        KeychainService.shared.deletePINHash()
+        super.tearDown()
+    }
+
+    func test_hashPIN_verifyPIN_roundTrip() {
+        KeychainService.shared.savePINHash(for: "123456")
+        XCTAssertTrue(KeychainService.shared.verifyPIN("123456"))
+        XCTAssertFalse(KeychainService.shared.verifyPIN("654321"))
+    }
+
+    func test_hashPIN_usesDistinctSaltsForSamePIN() {
+        KeychainService.shared.savePINHash(for: "123456")
+        let first = KeychainService.shared.loadPINHashRecord()
+        KeychainService.shared.savePINHash(for: "123456")
+        let second = KeychainService.shared.loadPINHashRecord()
+
+        XCTAssertNotNil(first)
+        XCTAssertNotNil(second)
+        XCTAssertNotEqual(first?.salt, second?.salt, "Each PIN hash must use a fresh random salt")
+        XCTAssertNotEqual(first?.hash, second?.hash, "Same PIN with different salts must yield different hashes")
+    }
+
+    func test_hashPIN_isNotPlainSHA256() {
+        KeychainService.shared.savePINHash(for: "123456")
+        let record = KeychainService.shared.loadPINHashRecord()
+        XCTAssertNotNil(record)
+        // A salted KDF output must not equal the legacy unsalted SHA-256 of the PIN.
+        XCTAssertNotEqual(record?.hash, KeychainService.shared.legacyUnsaltedSHA256("123456"))
+    }
+
+    func test_verifyPIN_migratesLegacyUnsaltedHash_onSuccessfulUnlock() {
+        // Simulate an existing install with the old unsalted SHA-256 hash.
+        KeychainService.shared.saveLegacyPINHash(for: "123456")
+        XCTAssertTrue(KeychainService.shared.verifyPIN("123456"))
+
+        let migrated = KeychainService.shared.loadPINHashRecord()
+        XCTAssertNotNil(migrated)
+        XCTAssertNotNil(migrated?.salt, "Migrated hash must carry a per-PIN salt")
+        XCTAssertNotEqual(migrated?.hash, KeychainService.shared.legacyUnsaltedSHA256("123456"),
+                          "Legacy unsalted hash must be replaced by a salted KDF hash")
+        XCTAssertTrue(KeychainService.shared.verifyPIN("123456"), "Migrated hash must still verify the PIN")
+    }
+
+    func test_verifyPIN_doesNotMigrate_onFailedUnlock() {
+        KeychainService.shared.saveLegacyPINHash(for: "123456")
+        XCTAssertFalse(KeychainService.shared.verifyPIN("000000"))
+
+        let record = KeychainService.shared.loadPINHashRecord()
+        XCTAssertNil(record?.salt, "A failed unlock must not migrate the legacy hash")
+        XCTAssertEqual(record?.hash, KeychainService.shared.legacyUnsaltedSHA256("123456"))
+    }
+}
+
 // MARK: - #24 Sign-Out Push Token Unregistration Tests with Real Host
 
 @MainActor

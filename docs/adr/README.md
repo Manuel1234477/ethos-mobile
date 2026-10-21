@@ -13,3 +13,4 @@ Each ADR follows the template in [adr-template.md](adr-template.md). ADRs are nu
 | [ADR-0001](adr-0001-offline-first.md) | Offline-First Architecture | Accepted |
 | [ADR-0002](adr-0002-widgetkit-ios-widgets.md) | WidgetKit for iOS Widgets | Accepted |
 | [ADR-0003](adr-0003-credentialmanager-android-passkeys.md) | CredentialManager for Android Passkeys | Accepted |
+| [ADR-0004](adr-0004-icloud-associations-account-scoping.md) | iCloud Associations Account Scoping | Accepted |

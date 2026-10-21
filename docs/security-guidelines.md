@@ -191,14 +191,21 @@ storage is a security boundary.
 
 - **NEVER** store a bare, unsalted fast hash of a PIN. A 6-digit PIN is ~10^6
   candidates — a single SHA-256 over the digits is trivially brute-forced offline if
-  the hash ever leaks. The current iOS implementation
-  (`KeychainService.hashPIN`) is a plain `CC_SHA256` with no salt and no iterations.
-- **MUST** use a memory-hard or iterated KDF (PBKDF2-HMAC-SHA256 with a high iteration
-  count, or Argon2/scrypt) with a **per-install random salt** stored alongside the
-  verifier.
-- **MUST** bound attempts. Track failed attempts in a persisted counter, apply
-  exponential backoff, and lock out after a threshold. Without a counter, PIN entry is
-  an unlimited guessing oracle bounded only by the UI.
+  the hash ever leaks. The former iOS implementation
+  (`KeychainService.hashPIN`) was a plain `CC_SHA256` with no salt and no iterations;
+  it has been replaced (see below).
+- **MUST** use a memory-hard or iterated KDF (PBKDF2-HMAC-SHA256 with at least 600,000
+  iterations, or Argon2id) with a **per-PIN random salt** stored alongside the
+  verifier in the Keychain. `KeychainService` now derives the PIN verifier with
+  PBKDF2-HMAC-SHA256 and a per-PIN random salt, and stores the salt next to the hash.
+- **MUST** migrate legacy verifiers. A stored unsalted SHA-256 hash is upgraded to the
+  salted KDF on the next successful unlock, in the same operation that verifies the
+  PIN, so no user is left on the weak format.
+- **MUST** bound attempts. Track failed attempts in a persisted counter, apply an
+  escalating cooldown (reusing the `OTPRateLimiter` schedule), and require the device
+  passcode or a re-login after a fixed number of failures. Without a counter, PIN
+  entry is an unlimited guessing oracle bounded only by the UI.
+  `PINAuthenticationService` now enforces this.
 - **SHOULD** prefer biometric/device-credential over a PIN wherever the platform
   allows it, and let the user remove the PIN entirely.
 
@@ -592,7 +599,7 @@ are not a disclosure list — if you find something new, report it per
 
 | Area | Gap | Direction |
 |------|-----|-----------|
-| iOS PIN storage | Plain unsalted SHA-256, no attempt limiting | §2.4 |
+
 | Clipboard | `SensitiveClipboard` exists but several copy paths bypass it | §2.5 |
 | iOS Keychain | Access group declared in entitlements but not set on `SecItem` calls, so widget reads may fail | §2.3 |
 | Nonce generation | iOS uses `UInt8.random`; the contract mandates `CryptoKit.SymmetricKey` | §3.3 |
