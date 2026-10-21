@@ -19,6 +19,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -210,5 +211,16 @@ class ApiClientTest {
             "Your recovery code has expired. Please request a new one.",
             (result as ApiResult.Error).message
         )
+    }
+
+    // #592: pinning must fail closed. If the platform TrustManager cannot be obtained,
+    // engine construction must throw rather than silently running without pinning.
+    @Test
+    fun `null system TrustManager fails closed instead of skipping pinning`() {
+        val failure = assertThrows(IllegalStateException::class.java) {
+            ApiClient.sslManager(systemTm = null)
+        }
+
+        assertTrue(failure.message.orEmpty().contains("TrustManager"))
     }
 }
