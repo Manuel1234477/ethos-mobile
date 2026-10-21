@@ -4,6 +4,9 @@ import com.ethosprotocol.api.RetryPolicy
 import com.ethosprotocol.api.withRetry
 import java.io.IOException
 import kotlin.random.Random
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.*
 import org.junit.Test
@@ -180,6 +183,57 @@ class RetryPolicyTest {
 
         assertEquals("check_in_recorded", result)
         assertEquals(2, postCount, "Mutating request should only be submitted twice")
+    }
+
+    @Test
+    fun `withRetry rethrows CancellationException instead of retrying when cancelled during backoff`() = runTest {
+        val sleepStarted = CompletableDeferred<Unit>()
+        val neverResume = CompletableDeferred<Unit>()
+        val policy = RetryPolicy(
+            maxAttempts = 5,
+            baseDelayMillis = 100,
+            sleep = {
+                sleepStarted.complete(Unit)
+                neverResume.await()
+            },
+            random = Random.Default
+        )
+        var attempts = 0
+
+        val job = launch {
+            withRetry(policy, isRetryable = { true }) {
+                attempts++
+                throw IOException("boom")
+            }
+        }
+
+        sleepStarted.await()
+        job.cancel()
+        job.join()
+
+        assertTrue("Job should be cancelled", job.isCancelled)
+        assertEquals("Operation should run exactly once", 1, attempts)
+    }
+
+    @Test
+    fun `withRetry propagates CancellationException to the caller`() = runTest {
+        val policy = RetryPolicy(
+            maxAttempts = 3,
+            baseDelayMillis = 100,
+            sleep = {},
+            random = Random.Default
+        )
+        var attempts = 0
+
+        try {
+            withRetry(policy, isRetryable = { true }) {
+                attempts++
+                throw CancellationException("cancelled")
+            }
+            fail("Should have thrown CancellationException")
+        } catch (e: CancellationException) {
+            assertEquals(1, attempts, "Should not retry cancellation")
+        }
     }
 
     @Test

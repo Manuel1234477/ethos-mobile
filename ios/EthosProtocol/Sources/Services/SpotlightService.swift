@@ -1,5 +1,6 @@
 import Foundation
 import CoreSpotlight
+import OSLog
 
 // MARK: - SpotlightIndexing protocol seam (enables test mocking)
 
@@ -46,6 +47,21 @@ final class SpotlightService {
         "vault-\(vaultID)"
     }
 
+    // MARK: - Logging
+
+    private static let logger = Logger(
+        subsystem: "com.ethosprotocol",
+        category: "SpotlightService"
+    )
+
+    /// DEBUG-only logging routed through `LogRedactor` so vault IDs and error
+    /// text are redacted and nothing is emitted in release builds.
+    private static func log(_ message: String) {
+        #if DEBUG
+        logger.debug("\(LogRedactor.redact(message), privacy: .public)")
+        #endif
+    }
+
     // MARK: - Public API
 
     /// Donates a single vault to Spotlight.
@@ -59,7 +75,7 @@ final class SpotlightService {
             if let error {
                 // Non-fatal: Spotlight indexing can fail silently if the daemon is
                 // unavailable (e.g. device storage pressure).  Log and move on.
-                print("[SpotlightService] Failed to index vault \(vault.id): \(error)")
+                SpotlightService.log("[SpotlightService] Failed to index vault \(vault.id): \(error)")
             }
         }
     }
@@ -72,7 +88,7 @@ final class SpotlightService {
         let items = vaults.map { makeSearchableItem(for: $0) }
         index.indexSearchableItems(items) { error in
             if let error {
-                print("[SpotlightService] Failed to batch-index \(items.count) vaults: \(error)")
+                SpotlightService.log("[SpotlightService] Failed to batch-index \(items.count) vaults: \(error)")
             }
         }
     }
@@ -84,7 +100,7 @@ final class SpotlightService {
         let identifier = SpotlightService.uniqueIdentifier(for: vaultID)
         index.deleteSearchableItems(withIdentifiers: [identifier]) { error in
             if let error {
-                print("[SpotlightService] Failed to revoke vault \(vaultID): \(error)")
+                SpotlightService.log("[SpotlightService] Failed to revoke vault \(vaultID): \(error)")
             }
         }
     }
@@ -95,7 +111,7 @@ final class SpotlightService {
     func revokeAll() {
         index.deleteSearchableItems(withDomainIdentifiers: [SpotlightService.domainIdentifier]) { error in
             if let error {
-                print("[SpotlightService] Failed to revoke all vaults: \(error)")
+                SpotlightService.log("[SpotlightService] Failed to revoke all vaults: \(error)")
             }
         }
     }
