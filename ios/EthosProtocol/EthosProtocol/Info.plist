@@ -22,6 +22,11 @@
 	<key>NSFaceIDUsageDescription</key>
 	<string>Ethos-Protocol uses Face ID to confirm vault check-ins and protect access to your vault.</string>
 
+	<!-- Issue #472: VaultQRScannerView uses VisionKit's DataScannerViewController
+	     to scan a vault invitation QR code. -->
+	<key>NSCameraUsageDescription</key>
+	<string>Ethos-Protocol uses the camera to scan vault sharing QR codes.</string>
+
 	<!-- remote-notification: NotificationService registers for APNs and handles silent/background
 	     pushes. fetch: BackgroundRefreshService schedules a BGAppRefreshTaskRequest (see
 	     BGTaskSchedulerPermittedIdentifiers below), which requires the "fetch" background mode. -->

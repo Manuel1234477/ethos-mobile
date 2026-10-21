@@ -1,7 +1,9 @@
 package com.ethosprotocol.models
 
 import android.content.Context
+import android.util.Log
 import androidx.annotation.Keep
+import com.ethosprotocol.security.LogRedactor
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import java.util.Calendar
@@ -46,20 +48,47 @@ data class NotificationPreferences(
     }
 
     companion object {
+        private const val TAG = "NotificationPreferences"
         private const val PREFS_NAME = "notification_preferences"
         private const val KEY = "prefs_json"
+        private const val KEY_LAST_VALID = "prefs_json_last_valid"
+        private const val KEY_RESET_NOTICE = "prefs_reset_notice"
         private val json = Json { ignoreUnknownKeys = true }
 
+        /**
+         * Loads the stored preferences. If the stored value fails to decode, the last value that
+         * decoded successfully is returned instead of the defaults, so opted-out categories stay
+         * opted out. A reset notice is recorded for [consumeResetNotice] in that case.
+         */
         fun load(context: Context): NotificationPreferences {
             val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             val stored = prefs.getString(KEY, null) ?: return NotificationPreferences()
-            return try { json.decodeFromString(stored) } catch (_: Exception) { NotificationPreferences() }
+            decodeOrNull(stored)?.let { return it }
+
+            Log.w(TAG, LogRedactor.redactString("Stored notification preferences failed to decode; using last valid value"))
+            prefs.edit().putBoolean(KEY_RESET_NOTICE, true).apply()
+            return prefs.getString(KEY_LAST_VALID, null)?.let { decodeOrNull(it) } ?: NotificationPreferences()
         }
 
         fun save(context: Context, preferences: NotificationPreferences) {
             val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            prefs.edit().putString(KEY, json.encodeToString(preferences)).apply()
+            val encoded = json.encodeToString(preferences)
+            prefs.edit()
+                .putString(KEY, encoded)
+                .putString(KEY_LAST_VALID, encoded)
+                .apply()
         }
+
+        /** Returns true once if the stored preferences failed to decode since the last call, then clears the flag. */
+        fun consumeResetNotice(context: Context): Boolean {
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val pending = prefs.getBoolean(KEY_RESET_NOTICE, false)
+            if (pending) prefs.edit().putBoolean(KEY_RESET_NOTICE, false).apply()
+            return pending
+        }
+
+        private fun decodeOrNull(raw: String): NotificationPreferences? =
+            try { json.decodeFromString<NotificationPreferences>(raw) } catch (_: Exception) { null }
     }
 }
 

@@ -36,6 +36,13 @@
         and WorkManager state should not cross device boundaries — a restored
         pending check-in from a different device could replay an outdated action
         against the server.
+
+        #612 — pending_actions.db is now encrypted with SQLCipher, using a key
+        held in the Android Keystore. The Keystore key is non-exportable and
+        cannot be restored on another device, so a backed-up copy of the
+        database would be undecryptable ciphertext anyway. Excluding the whole
+        directory also covers the SQLCipher sidecar files (-wal, -shm, -journal)
+        that SQLite creates alongside the main database file.
     -->
     <exclude domain="database" path="." />
 </full-backup-content>

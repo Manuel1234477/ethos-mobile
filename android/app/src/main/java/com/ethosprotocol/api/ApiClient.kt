@@ -21,6 +21,7 @@ import io.ktor.client.statement.HttpResponse
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -71,13 +72,15 @@ class ApiClient(
     engine: HttpClientEngine = Android.create {
         sslManager = { httpsURLConnection ->
             val systemTm = getSystemTrustManager()
-            if (systemTm != null) {
-                val pinner = CertificatePinner()
-                val pinningTm = PinningTrustManager(pinner, systemTm)
-                val sslContext = SSLContext.getInstance("TLS")
-                sslContext.init(null, arrayOf<TrustManager>(pinningTm), null)
-                httpsURLConnection.sslSocketFactory = sslContext.socketFactory
-            }
+                ?: throw IllegalStateException(
+                    "Unable to obtain the system X509TrustManager; refusing to proceed " +
+                        "without certificate pinning (#592)."
+                )
+            val pinner = CertificatePinner()
+            val pinningTm = PinningTrustManager(pinner, systemTm)
+            val sslContext = SSLContext.getInstance("TLS")
+            sslContext.init(null, arrayOf<TrustManager>(pinningTm), null)
+            httpsURLConnection.sslSocketFactory = sslContext.socketFactory
         }
     },
     private val retryPolicy: RetryPolicy = RetryPolicy.networkDefault,
@@ -127,7 +130,16 @@ class ApiClient(
     // shared/api-contract.md) for VaultEventSocket.
     internal fun webSocketUrl(vaultId: String): String {
         val wsBase = baseUrl.replaceFirst("https://", "wss://").replaceFirst("http://", "ws://")
-        return "$wsBase/ws?vault_id=$vaultId"
+        return "$wsBase/ws?vault_id=${vaultPathSegment(vaultId)}"
+    }
+
+    // #597: Vault IDs are interpolated into request paths, so an ID containing `/`, `?`
+    // or `..` would silently retarget the request at a different endpoint. Validate the
+    // format once here (the boundary every ID passes through) and percent-encode the
+    // segment so it can never escape its path position.
+    private fun vaultPathSegment(id: String): String {
+        require(VaultDeepLinkParser.isValidVaultId(id)) { "Invalid vault ID" }
+        return encodeURLPathPart(id)
     }
 
     // Auth
@@ -146,7 +158,8 @@ class ApiClient(
     suspend fun listSessions(): ApiResult<List<Session>> = get("/auth/sessions")
 
     // "Sign out this device" for a specific session (may be the caller's own current session).
-    suspend fun revokeSession(id: String): ApiResult<Unit> = delete("/auth/sessions/$id", Unit)
+    suspend fun revokeSession(id: String): ApiResult<Unit> =
+        delete("/auth/sessions/${vaultPathSegment(id)}", Unit)
 
     // "Sign out all other devices" — revokes every session except the one making this call.
     suspend fun revokeOtherSessions(): ApiResult<Unit> = delete("/auth/sessions", Unit)
@@ -160,54 +173,61 @@ class ApiClient(
      * Continue while [VaultPage.hasMore] == true.
      */
     suspend fun listVaults(limit: Int = 20, after: String? = null): ApiResult<VaultPage> {
-        val path = buildString {
-            append("/vaults?limit=$limit")
-            if (after != null) append("&after=$after")
-        }
+        // #599: shared/api-contract.md §Pagination defines limit as 1..100; clamp rather
+        // than send a value the server must reject or silently reinterpret.
+        val clampedLimit = limit.coerceIn(1, 100)
+        // Cursors are opaque server-issued strings, so they must be percent-encoded:
+        // a raw cursor containing '&', '+', '=' or '#' would otherwise alter the query
+        // and silently skip or repeat results on the next page.
+        val path = URLBuilder("/vaults").apply {
+            parameters.append("limit", clampedLimit.toString())
+            if (after != null) parameters.append("after", after)
+        }.buildString()
         return get(path)
     }
-    suspend fun getVault(id: String): ApiResult<Vault> = get("/vaults/$id")
+    suspend fun getVault(id: String): ApiResult<Vault> = get("/vaults/${vaultPathSegment(id)}")
     suspend fun createVault(req: CreateVaultRequest, idempotencyKey: String? = null): ApiResult<Vault> =
         post("/vaults", req, idempotencyKey = idempotencyKey)
     suspend fun checkIn(vaultId: String, idempotencyKey: String? = null): ApiResult<Unit> =
-        post("/vaults/$vaultId/checkin", Unit, idempotencyKey = idempotencyKey)
+        post("/vaults/${vaultPathSegment(vaultId)}/checkin", Unit, idempotencyKey = idempotencyKey)
     suspend fun deposit(vaultId: String, amount: Long): ApiResult<Vault> =
-        post("/vaults/$vaultId/deposit", mapOf("amount" to amount))
+        post("/vaults/${vaultPathSegment(vaultId)}/deposit", mapOf("amount" to amount))
     suspend fun withdraw(vaultId: String, amount: Long): ApiResult<Vault> =
-        post("/vaults/$vaultId/withdraw", mapOf("amount" to amount))
+        post("/vaults/${vaultPathSegment(vaultId)}/withdraw", mapOf("amount" to amount))
 
     // Beneficiary
     // token: the acceptance token parsed from the /accept deep-link URL
     // (e.g. https://ethos-protocol.app/vaults/{id}/accept?token=<token>).
     // Required by the server — see shared/api-contract.md §POST /vaults/{id}/accept.
     suspend fun acceptBeneficiary(vaultId: String, token: String): ApiResult<Unit> =
-        post("/vaults/$vaultId/accept", BeneficiaryAcceptRequest(vaultId = vaultId, token = token))
+        post("/vaults/${vaultPathSegment(vaultId)}/accept", BeneficiaryAcceptRequest(vaultId = vaultId, token = token))
     suspend fun updateBeneficiary(vaultId: String, newBeneficiary: String): ApiResult<Vault> =
-        post("/vaults/$vaultId/beneficiary", BeneficiaryUpdateRequest(newBeneficiary))
+        post("/vaults/${vaultPathSegment(vaultId)}/beneficiary", BeneficiaryUpdateRequest(newBeneficiary))
 
     // 2FA
-    suspend fun get2FAStatus(vaultId: String): ApiResult<TwoFactorStatus> = get("/vaults/$vaultId/2fa/status")
+    suspend fun get2FAStatus(vaultId: String): ApiResult<TwoFactorStatus> =
+        get("/vaults/${vaultPathSegment(vaultId)}/2fa/status")
     suspend fun enable2FA(vaultId: String, req: Enable2FARequest): ApiResult<Enable2FAResponse> =
-        post("/vaults/$vaultId/2fa/enable", req)
+        post("/vaults/${vaultPathSegment(vaultId)}/2fa/enable", req)
     /** #226: `req.trustDevice` = true asks server to issue a 30-day device trust token. */
     suspend fun verify2FA(vaultId: String, req: Verify2FARequest): ApiResult<Verify2FAResponse> =
-        post("/vaults/$vaultId/2fa/verify", req)
+        post("/vaults/${vaultPathSegment(vaultId)}/2fa/verify", req)
     suspend fun disable2FA(vaultId: String): ApiResult<Unit> =
-        post("/vaults/$vaultId/2fa/disable", Unit)
+        post("/vaults/${vaultPathSegment(vaultId)}/2fa/disable", Unit)
     suspend fun challenge2FA(vaultId: String): ApiResult<TwoFactorStatus> =
-        post("/vaults/$vaultId/2fa/challenge", Unit)
+        post("/vaults/${vaultPathSegment(vaultId)}/2fa/challenge", Unit)
     /** #226: Call after verify2FA with trustDevice=true to request a device trust token. */
     suspend fun trustDevice(vaultId: String): ApiResult<TrustDeviceResponse> =
-        post("/vaults/$vaultId/2fa/trust-device", TrustDeviceRequest())
+        post("/vaults/${vaultPathSegment(vaultId)}/2fa/trust-device", TrustDeviceRequest())
     /** #224: Generates 8 fresh one-time backup codes (invalidates prior set). */
     suspend fun generateBackupCodes(vaultId: String): ApiResult<BackupCodesResponse> =
-        post("/vaults/$vaultId/2fa/backup-codes/generate", Unit)
+        post("/vaults/${vaultPathSegment(vaultId)}/2fa/backup-codes/generate", Unit)
     /** #224: Returns whether backup codes exist + count, never the code values. */
     suspend fun getBackupCodesStatus(vaultId: String): ApiResult<BackupCodesStatus> =
-        get("/vaults/$vaultId/2fa/backup-codes/status")
+        get("/vaults/${vaultPathSegment(vaultId)}/2fa/backup-codes/status")
     /** #225: Atomically initiates a method switch; old method stays active until new one is verified. */
     suspend fun switch2FAMethod(vaultId: String, req: Switch2FARequest): ApiResult<Enable2FAResponse> =
-        post("/vaults/$vaultId/2fa/switch", req)
+        post("/vaults/${vaultPathSegment(vaultId)}/2fa/switch", req)
 
     // Push
     suspend fun registerPushToken(token: String): ApiResult<Unit> =
@@ -259,14 +279,32 @@ class ApiClient(
         if (!circuitBreaker.allowRequest()) return ApiResult.Error("API temporarily unavailable", 503)
         return runCatching {
             val _apmStart = SystemClock.elapsedRealtime()
-            val response = client.post("$baseUrl$path") {
+            // Serialize once so the exact bytes that are signed are the bytes that are sent.
+            val bodyBytes = Json.encodeToString(
+                kotlinx.serialization.serializer(),
+                body
+            ).toByteArray(Charsets.UTF_8)
+            var response = client.post("$baseUrl$path") {
                 standardHeaders()
                 bearerAuth()
-                antiReplayHeaders(idempotencyKey)
+                antiReplayHeaders(HttpMethod.Post, path, bodyBytes, idempotencyKey)
                 contentType(ContentType.Application.Json)
-                setBody(body)
+                setBody(bodyBytes)
             }
             ApiCompressionMetrics.record(response)
+            // #609: documented recovery for `replay_detected` (docs/api-error-codes.md) —
+            // regenerate X-Nonce/X-Timestamp and retry the mutation exactly once. The
+            // idempotency key is intentionally kept stable across the retry.
+            if (response.isReplayDetected()) {
+                response = client.post("$baseUrl$path") {
+                    standardHeaders()
+                    bearerAuth()
+                    antiReplayHeaders(HttpMethod.Post, path, bodyBytes, idempotencyKey)
+                    contentType(ContentType.Application.Json)
+                    setBody(bodyBytes)
+                }
+                ApiCompressionMetrics.record(response)
+            }
             val result = when (response.status.value) {
                 in 200..299 -> ApiResult.Success(if (T::class == Unit::class) Unit as T else response.body())
                 // #211: a 401 can carry a human-readable reason in its body (e.g. an expired
@@ -294,14 +332,30 @@ class ApiClient(
         if (!circuitBreaker.allowRequest()) return ApiResult.Error("API temporarily unavailable", 503)
         return runCatching {
             val _apmStart = SystemClock.elapsedRealtime()
-            val response = client.delete("$baseUrl$path") {
+            val bodyBytes = Json.encodeToString(
+                kotlinx.serialization.serializer(),
+                body
+            ).toByteArray(Charsets.UTF_8)
+            var response = client.delete("$baseUrl$path") {
                 standardHeaders()
                 bearerAuth()
-                antiReplayHeaders()
+                antiReplayHeaders(HttpMethod.Delete, path, bodyBytes)
                 contentType(ContentType.Application.Json)
-                setBody(body)
+                setBody(bodyBytes)
             }
             ApiCompressionMetrics.record(response)
+            // #609: documented recovery for `replay_detected` (docs/api-error-codes.md) —
+            // regenerate X-Nonce/X-Timestamp and retry the mutation exactly once.
+            if (response.isReplayDetected()) {
+                response = client.delete("$baseUrl$path") {
+                    standardHeaders()
+                    bearerAuth()
+                    antiReplayHeaders(HttpMethod.Delete, path, bodyBytes)
+                    contentType(ContentType.Application.Json)
+                    setBody(bodyBytes)
+                }
+                ApiCompressionMetrics.record(response)
+            }
             // Ktor does not throw on non-2xx responses by default, so the status must be
             // checked explicitly here (as get()/post() already do) — otherwise a failed
             // deletion (401/500/etc.) is silently reported back to callers as success.
@@ -381,6 +435,16 @@ class ApiClient(
             else "Rate limited. Retry after $retryAfter seconds."
     }
 
+    // #609: detects the documented `{"error": "replay_detected"}` body on HTTP 400/403
+    // (see docs/api-error-codes.md). Used by post()/delete() to regenerate the anti-replay
+    // headers and retry a mutating request once. GETs are idempotent and never retried here.
+    private suspend fun HttpResponse.isReplayDetected(): Boolean {
+        if (status.value != 400 && status.value != 403) return false
+        return runCatching {
+            Json.decodeFromString<Map<String, String>>(bodyAsText())["error"] == "replay_detected"
+        }.getOrDefault(false)
+    }
+
     private fun isRetryableNetworkError(e: Throwable): Boolean =
         e is HttpRequestTimeoutException || e is IOException
 
@@ -426,6 +490,14 @@ class ApiClient(
             val result = block()
             deferred.complete(result as ApiResult<Any?>)
             return result
+        } catch (e: CancellationException) {
+            // #600: the leader's coroutine was cancelled (e.g. its screen was dismissed).
+            // That cancellation belongs to the leader alone — completing the shared
+            // deferred exceptionally would hand every follower a CancellationException
+            // for a request it never cancelled. Drop the in-flight entry so followers
+            // (and later callers) start a fresh leader instead.
+            requestDedupMutex.withLock { inFlightGetRequests.remove(key) }
+            throw e
         } catch (e: Throwable) {
             deferred.completeExceptionally(e)
             throw e
@@ -452,22 +524,58 @@ class ApiClient(
     //                  intentionally NOT regenerated per attempt, so the server can recognize
     //                  a resubmission as a duplicate of a specific prior attempt rather than a
     //                  brand-new request.
-    private fun HttpRequestBuilder.antiReplayHeaders(idempotencyKey: String? = null) {
+    private fun HttpRequestBuilder.antiReplayHeaders(
+        method: HttpMethod,
+        path: String,
+        bodyBytes: ByteArray?,
+        idempotencyKey: String? = null
+    ) {
         val nonce = ByteArray(32).also { SecureRandom().nextBytes(it) }
             .joinToString("") { "%02x".format(it) }
         val timestamp = System.currentTimeMillis() / 1_000L
         header("X-Nonce", nonce)
         header("X-Timestamp", timestamp.toString())
-        requestSignature(nonce, timestamp, idempotencyKey)?.let { header("X-Request-Signature", it) }
+        requestSignature(method, path, bodyBytes, nonce, timestamp, idempotencyKey)
+            ?.let { header("X-Request-Signature", it) }
         if (idempotencyKey != null) header("X-Idempotency-Key", idempotencyKey)
     }
 
-    private fun requestSignature(nonce: String, timestamp: Long, idempotencyKey: String?): String? {
-        val token = tokenProvider.token ?: return null
-        val canonical = listOf(nonce, timestamp.toString(), idempotencyKey.orEmpty()).joinToString(":")
+    // #607: The HMAC key must NOT be the bearer token. The bearer token already travels on
+    // every request, so a network observer that captures it could forge a valid MAC — the
+    // signature would add no secrecy. Instead we derive a distinct signing key from the
+    // server-issued session secret (TokenProvider.signingSecret), which is never sent on the
+    // wire. If the server has not issued a signing secret, we omit the header entirely
+    // (issue #56) rather than fall back to the bearer token.
+    //
+    // The canonical string binds the signature to the specific request so a captured
+    // signature cannot be replayed against another endpoint or with a different payload:
+    //   METHOD \n PATH \n SHA-256(body) \n nonce \n timestamp \n idempotencyKey
+    private fun requestSignature(
+        method: HttpMethod,
+        path: String,
+        bodyBytes: ByteArray?,
+        nonce: String,
+        timestamp: Long,
+        idempotencyKey: String?
+    ): String? {
+        val signingSecret = tokenProvider.signingSecret ?: return null
+        val bodyHash = sha256Hex(bodyBytes ?: ByteArray(0))
+        val canonical = listOf(
+            method.value,
+            path,
+            bodyHash,
+            nonce,
+            timestamp.toString(),
+            idempotencyKey.orEmpty()
+        ).joinToString("\n")
         val mac = Mac.getInstance("HmacSHA256")
-        mac.init(SecretKeySpec(token.toByteArray(), "HmacSHA256"))
-        return Base64.encodeToString(mac.doFinal(canonical.toByteArray()), Base64.NO_WRAP)
+        mac.init(SecretKeySpec(signingSecret.toByteArray(Charsets.UTF_8), "HmacSHA256"))
+        return Base64.encodeToString(mac.doFinal(canonical.toByteArray(Charsets.UTF_8)), Base64.NO_WRAP)
+    }
+
+    private fun sha256Hex(bytes: ByteArray): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256").digest(bytes)
+        return digest.joinToString("") { "%02x".format(it) }
     }
 }
 

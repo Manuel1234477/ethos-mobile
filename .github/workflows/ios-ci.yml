@@ -10,11 +10,15 @@ defaults:
   run:
     working-directory: ios/EthosProtocol
 
+# Read-only by default. A job that needs more scope must say so itself.
+permissions:
+  contents: read
+
 jobs:
   build-and-test:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Runs before any Xcode toolchain/build work: this only needs the
       # checked-out sources (the script itself + the target Info.plists),
@@ -96,7 +100,7 @@ jobs:
       - name: Review dependency changes for high severity vulnerabilities
         if: github.event_name == 'pull_request'
         continue-on-error: true
-        uses: actions/dependency-review-action@v4
+        uses: actions/dependency-review-action@v5
         # Non-blocking: dependency-review requires the Dependency graph feature
         # to be enabled in repo settings (Settings → Security → Code security).
         # If it is disabled the action errors with "not supported on this
@@ -205,7 +209,7 @@ jobs:
 
       - name: Upload iOS coverage to Codecov
         if: always()
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v7
         with:
           files: ios/EthosProtocol/coverage.lcov
           flags: ios
@@ -252,7 +256,7 @@ jobs:
 
       - name: Measure app size
         run: |
-          python3 "$GITHUB_WORKSPACE/.github/scripts/track_build_size.py" ios
+          python3 "$GITHUB_WORKSPACE/.github/scripts/track_build_size.py" ios "${{ vars.IOS_BASE_SIZE_MB }}"
 
       # Runs hosted tests that require a real app process (Keychain, UNUserNotificationCenter).
       # These tests are in EthosProtocolTests target within the Xcode project, not in the SPM
@@ -296,7 +300,7 @@ jobs:
       run:
         working-directory: ios/EthosProtocol
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode.app
@@ -361,3 +365,16 @@ jobs:
             -only-testing:EthosProtocolUITests \
             -skipMacroValidation \
             -resultBundlePath ui-test-results.xcresult
+
+  # Guards the ui-tests continue-on-error exemption (#574). The exemption is dated here and
+  # this job fails once that date has passed, so it cannot stay in place without a decision.
+  ui-tests-exemption-expiry:
+    name: ui-tests exemption expiry
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail once the ui-tests exemption expires
+        run: |
+          if [ "$(date -u +%F)" > "2026-12-31" ]; then
+            echo "::error::ui-tests has continue-on-error set and its expiry (2026-12-31) has passed. Make the job blocking."
+            exit 1
+          fi

@@ -193,6 +193,73 @@ class CheckTargetTests(unittest.TestCase):
             self.assertNotIn("EthosProtocol: TLS_PUBLIC_KEY_PINS", output)
 
 
+class SharedPinSourceTests(unittest.TestCase):
+    """The pin set is single-sourced in shared/cert-pins.json; the gate must
+    fail when an Info.plist disagrees with it or when the shared file is gone."""
+
+    def _write_shared(self, directory: Path, pins: list[str]) -> str:
+        path = directory / "cert-pins.json"
+        path.write_text(
+            '{"pins": [' + ", ".join(f'"{p}"' for p in pins) + "]}",
+            encoding="utf-8",
+        )
+        return str(path)
+
+    def test_passes_when_plist_matches_shared_pins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pins = ["k1Vw6WsE9scmn9tRAWjOTNTWyfPpWWx3fV1c/dCLwyQ="]
+            shared = self._write_shared(Path(tmp), pins)
+            plist_path = write_plist(Path(tmp), "Info.plist", {
+                **BASE_PLIST,
+                "TLS_PUBLIC_KEY_PINS": pins,
+            })
+
+            code, output = run_main([
+                "--configuration", "Release",
+                "--target", f"EthosProtocol:{plist_path}",
+                "--shared-pins", shared,
+            ])
+
+            self.assertEqual(code, 0)
+            self.assertIn("passed", output)
+
+    def test_fails_when_plist_pins_differ_from_shared_pins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = self._write_shared(
+                Path(tmp), ["k1Vw6WsE9scmn9tRAWjOTNTWyfPpWWx3fV1c/dCLwyQ="]
+            )
+            plist_path = write_plist(Path(tmp), "Info.plist", {
+                **BASE_PLIST,
+                "TLS_PUBLIC_KEY_PINS": ["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="],
+            })
+
+            code, output = run_main([
+                "--configuration", "Release",
+                "--target", f"EthosProtocol:{plist_path}",
+                "--shared-pins", shared,
+            ])
+
+            self.assertEqual(code, 1)
+            self.assertIn("EthosProtocol", output)
+            self.assertIn("shared", output.lower())
+
+    def test_fails_when_shared_pins_file_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plist_path = write_plist(Path(tmp), "Info.plist", {
+                **BASE_PLIST,
+                "TLS_PUBLIC_KEY_PINS": ["k1Vw6WsE9scmn9tRAWjOTNTWyfPpWWx3fV1c/dCLwyQ="],
+            })
+
+            code, output = run_main([
+                "--configuration", "Release",
+                "--target", f"EthosProtocol:{plist_path}",
+                "--shared-pins", str(Path(tmp) / "missing-cert-pins.json"),
+            ])
+
+            self.assertEqual(code, 1)
+            self.assertIn("cert-pins.json", output)
+
+
 class DebugConfigurationTests(unittest.TestCase):
     def test_debug_configuration_does_not_fail_when_pins_are_absent(self):
         """Matches PinningDelegate's documented design: an empty/absent pin

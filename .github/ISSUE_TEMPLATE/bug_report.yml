@@ -1,0 +1,27 @@
+name: Bug report
+description: Something works differently from how it should
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options: [Android, iOS, Backend, CI/Scripts, Other]
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: App or build version
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behaviour
+    validations:
+      required: true
