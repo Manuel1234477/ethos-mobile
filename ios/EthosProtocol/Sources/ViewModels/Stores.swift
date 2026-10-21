@@ -335,6 +335,8 @@ final class VaultStore: ObservableObject {
     @Published var sortOption: VaultSortOption = .expiryDate {
         didSet { saveSearchPreferences() }
     }
+    /// Issue #477: filter to vaults carrying this tag, or nil for no tag filter.
+    @Published var tagFilter: String?
 
     private var eventSocket: VaultEventSocket?
 
@@ -347,7 +349,8 @@ final class VaultStore: ObservableObject {
     /// Whether a further page is available for VaultListView's "Load More".
     var hasMorePages: Bool { nextCursor != nil }
 
-    /// Filtered and sorted vaults based on search text, status filter, and sort option
+    /// Filtered and sorted vaults based on search text, status filter, sort option,
+    /// and (#477) tag filter.
     var filteredAndSortedVaults: [Vault] {
         // Issue #474: vaults merged away into another vault are hidden from
         // the main list — they still exist and VaultMergeStore can un-merge
@@ -357,7 +360,8 @@ final class VaultStore: ObservableObject {
             .filter { vault in
                 !hidden.contains(vault.id) &&
                 statusFilter.matches(vault: vault) &&
-                (searchText.isEmpty || vault.id.lowercased().contains(searchText.lowercased()))
+                (searchText.isEmpty || vault.id.lowercased().contains(searchText.lowercased())) &&
+                (tagFilter == nil || VaultTagStore.tags(for: vault.id).contains(tagFilter!))
             }
             .sorted { lhs, rhs in
                 sortOption.compare(lhs: lhs, rhs: rhs)
@@ -493,6 +497,7 @@ final class VaultStore: ObservableObject {
             // overload — pin the reference to the original before calling it.
             let performCheckIn: (String, String?) async throws -> Void = APIClient.shared.checkIn(vaultID:idempotencyKey:)
             try await performCheckIn(vault.id, idempotencyKey)
+            VaultActionLog.record(.checkIn, for: vault.id) // #479
             if !Task.isCancelled { await load() }
         } catch APIError.networkUnavailable {
             // Offline: queue the check-in durably so it is retried when connectivity
@@ -527,6 +532,7 @@ final class VaultStore: ObservableObject {
         error = nil
         do {
             _ = try await APIClient.shared.deposit(vaultID: vault.id, amount: amount)
+            VaultActionLog.record(.deposit, for: vault.id) // #479
             if !Task.isCancelled { await load() }
         } catch {
             ifNotCancelled { self.error = ErrorPresentation(error) }
@@ -539,6 +545,7 @@ final class VaultStore: ObservableObject {
         error = nil
         do {
             _ = try await APIClient.shared.withdraw(vaultID: vault.id, amount: amount)
+            VaultActionLog.record(.withdraw, for: vault.id) // #479
             if !Task.isCancelled { await load() }
         } catch {
             ifNotCancelled { self.error = ErrorPresentation(error) }

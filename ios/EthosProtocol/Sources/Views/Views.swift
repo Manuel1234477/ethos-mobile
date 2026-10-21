@@ -543,6 +543,27 @@ struct VaultListView: View {
                                 .cornerRadius(6)
                             }
 
+                            // Issue #477: filter by tag, when any tag has been assigned.
+                            let knownTags = VaultTagStore.allKnownTags()
+                            if !knownTags.isEmpty {
+                                Menu {
+                                    Button("All Tags") { vaultStore.tagFilter = nil }
+                                    ForEach(knownTags, id: \.self) { tag in
+                                        Button(tag) { vaultStore.tagFilter = tag }
+                                    }
+                                } label: {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "tag")
+                                        Text(vaultStore.tagFilter ?? "All Tags")
+                                            .font(.caption2)
+                                    }
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 6)
+                                    .background(Color.blue.opacity(0.1))
+                                    .cornerRadius(6)
+                                }
+                            }
+
                             Spacer()
                         }
                         .padding(.horizontal)
@@ -723,6 +744,12 @@ struct VaultRowView: View {
     let vault: Vault
     @EnvironmentObject var vaultStore: VaultStore
     @State private var showDeleteConfirmation = false
+    // Issue #477: VaultTagStore is a plain UserDefaults-backed store, not an
+    // ObservableObject, so tags are mirrored into local @State and refreshed
+    // after every mutation to drive re-rendering.
+    @State private var tags: [String] = []
+    @State private var showAddTag = false
+    @State private var newTagText = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -750,8 +777,45 @@ struct VaultRowView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
+            if !tags.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(tags, id: \.self) { tag in
+                            Text(tag)
+                                .font(.caption2)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .background(Color.accentColor.opacity(0.15))
+                                .clipShape(Capsule())
+                        }
+                    }
+                }
+            }
         }
         .padding(.vertical, 4)
+        .onAppear { tags = VaultTagStore.tags(for: vault.id) }
+        .contextMenu {
+            Button { showAddTag = true } label: {
+                Label("Add Tag", systemImage: "tag")
+            }
+            ForEach(tags, id: \.self) { tag in
+                Button(role: .destructive) {
+                    VaultTagStore.removeTag(tag, from: vault.id)
+                    tags = VaultTagStore.tags(for: vault.id)
+                } label: {
+                    Label("Remove \"\(tag)\"", systemImage: "tag.slash")
+                }
+            }
+        }
+        .alert("Add Tag", isPresented: $showAddTag) {
+            TextField("Tag name", text: $newTagText)
+            Button("Add") {
+                VaultTagStore.addTag(newTagText, to: vault.id)
+                tags = VaultTagStore.tags(for: vault.id)
+                newTagText = ""
+            }
+            Button("Cancel", role: .cancel) { newTagText = "" }
+        }
         .swipeActions(edge: .leading, allowsFullSwipe: false) {
             Button(action: { performCheckIn() }) {
                 Label("Check In", systemImage: "checkmark.circle.fill")
@@ -944,9 +1008,17 @@ struct VaultDetailView: View {
                     Label("Expiry Notifications", systemImage: "bell.fill")
                 }
             }
+
+            // Issue #479: local action history and frequency stats.
+            Section {
+                NavigationLink(destination: VaultHistoryView(vault: vault)) {
+                    Label("Action History", systemImage: "clock.arrow.circlepath")
+                }
+            }
         }
         .navigationTitle("Vault")
         .navigationBarTitleDisplayMode(.inline)
+        .onAppear { VaultActionLog.record(.view, for: vault.id) }
         // `.task` auto-cancels when the view disappears, so this polling loop
         // (and the in-flight `getTTL` request it may be awaiting) stops cleanly
         // on navigating away instead of continuing to run in the background.

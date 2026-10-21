@@ -17,6 +17,15 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
     }
     var retryPolicy: RetryPolicy = .networkDefault
 
+    /// Issue #478: delay (seconds, >= `minimum`) before a near-immediate local
+    /// notification should actually fire, pushed out past quiet hours if the
+    /// user is currently in them.
+    private func deferredDelay(minimum: TimeInterval) -> TimeInterval {
+        let now = Date()
+        let allowed = NotificationPreferences.current.nextAllowedDeliveryDate(from: now)
+        return max(minimum, allowed.timeIntervalSince(now))
+    }
+
     func requestPermission() async {
         let granted = (try? await UNUserNotificationCenter.current()
             .requestAuthorization(options: [.alert, .badge, .sound])) ?? false
@@ -156,7 +165,7 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
         content.title = LocalizedStrings.queuedCheckInTitle
         content.body = LocalizedStrings.queuedCheckInBody(count: count)
 
-        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false)
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: deferredDelay(minimum: 1), repeats: false)
         let request = UNNotificationRequest(identifier: Self.queuedCheckInIdentifier, content: content, trigger: trigger)
         center.removePendingNotificationRequests(withIdentifiers: [Self.queuedCheckInIdentifier])
         center.add(request)
@@ -177,7 +186,7 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
         content.body = LocalizedStrings.vaultExpiredBody
         content.sound = .default
         content.userInfo = ["vault_id": vaultId]
-        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false)
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: deferredDelay(minimum: 1), repeats: false)
         let request = UNNotificationRequest(identifier: identifier, content: content, trigger: trigger)
         center.add(request)
     }
@@ -296,22 +305,65 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
         NotificationDeliveryLog.shared.record(kind: .scheduled, source: .local, eventType: "snooze_reminder", vaultID: vaultID)
     }
 
+    private static let ttlWarningBatchIdentifier = "ttl-warning-batch"
+    private static let ttlWarningBatchDefaultsKey = "com.ethosprotocol.pending_ttl_warning_batch"
+
     // Fires immediately to warn the user their vault TTL is under 24 hours (called from background refresh).
+    //
+    // #478: outside quiet hours this behaves as before — one immediate per-vault
+    // notification. During quiet hours, instead of firing (and silently queuing)
+    // a separate notification per vault as each one's TTL crosses the warning
+    // threshold, vault IDs accumulate into one pending batch that's delivered as
+    // a single combined notification when quiet hours end.
     func scheduleTTLWarning(vaultID: String, ttlRemaining: UInt64) {
         let center = UNUserNotificationCenter.current()
         center.removePendingNotificationRequests(withIdentifiers: ["ttl-warning-\(vaultID)"])
 
+        guard NotificationPreferences.current.isSuppressedByQuietHours() else {
+            let content = UNMutableNotificationContent()
+            content.title = LocalizedStrings.ttlWarningTitle
+            content.body = LocalizedStrings.ttlWarningBody(vaultID: truncatedVaultID(vaultID), timeRemaining: formatTTLRemaining(Int(ttlRemaining)))
+            content.sound = .default
+            content.userInfo = ["vault_id": vaultID]
+            content.categoryIdentifier = "CHECK_IN"
+
+            let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 5, repeats: false)
+            let request = UNNotificationRequest(identifier: "ttl-warning-\(vaultID)", content: content, trigger: trigger)
+            center.add(request)
+            NotificationDeliveryLog.shared.record(kind: .scheduled, source: .local, eventType: "ttl_warning", vaultID: vaultID)
+            return
+        }
+
+        var pending = Set(UserDefaults.standard.stringArray(forKey: Self.ttlWarningBatchDefaultsKey) ?? [])
+        pending.insert(vaultID)
+        UserDefaults.standard.set(Array(pending), forKey: Self.ttlWarningBatchDefaultsKey)
+
         let content = UNMutableNotificationContent()
         content.title = LocalizedStrings.ttlWarningTitle
-        content.body = LocalizedStrings.ttlWarningBody(vaultID: truncatedVaultID(vaultID), timeRemaining: formatTTLRemaining(Int(ttlRemaining)))
+        content.body = pending.count == 1
+            ? LocalizedStrings.ttlWarningBody(vaultID: truncatedVaultID(vaultID), timeRemaining: formatTTLRemaining(Int(ttlRemaining)))
+            : "\(pending.count) vaults have TTL warnings waiting."
         content.sound = .default
-        content.userInfo = ["vault_id": vaultID]
         content.categoryIdentifier = "CHECK_IN"
 
-        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 5, repeats: false)
-        let request = UNNotificationRequest(identifier: "ttl-warning-\(vaultID)", content: content, trigger: trigger)
-        center.add(request)
-        NotificationDeliveryLog.shared.record(kind: .scheduled, source: .local, eventType: "ttl_warning", vaultID: vaultID)
+        center.removePendingNotificationRequests(withIdentifiers: [Self.ttlWarningBatchIdentifier])
+        let delay = deferredDelay(minimum: 5)
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: delay, repeats: false)
+        let request = UNNotificationRequest(identifier: Self.ttlWarningBatchIdentifier, content: content, trigger: trigger)
+        center.add(request) { [weak self] error in
+            guard error == nil else { return }
+            // Clear the pending set once the batch has actually been scheduled for
+            // delivery, so the next call starts a fresh batch instead of growing
+            // this one forever.
+            self?.clearPendingTTLWarningBatchAfter(delay: delay)
+        }
+        NotificationDeliveryLog.shared.record(kind: .scheduled, source: .local, eventType: "ttl_warning_batched", vaultID: vaultID)
+    }
+
+    private func clearPendingTTLWarningBatchAfter(delay: TimeInterval) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            UserDefaults.standard.removeObject(forKey: Self.ttlWarningBatchDefaultsKey)
+        }
     }
 
     func registerNotificationCategories() {
