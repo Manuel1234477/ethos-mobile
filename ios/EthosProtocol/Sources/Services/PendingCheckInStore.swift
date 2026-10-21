@@ -71,28 +71,30 @@ final class PendingCheckInStore {
 
     /// Enqueue a check-in for `vaultId`. Idempotent — a vault already in the queue
     /// is not duplicated (mirrors Android's `OnConflictStrategy.REPLACE`).
-    func insert(_ item: PendingCheckIn) {
-        queue.sync {
+    /// Throws if the queue could not be persisted, so the caller can surface the
+    /// failure instead of silently losing a time-sensitive check-in.
+    func insert(_ item: PendingCheckIn) throws {
+        try queue.sync {
             var items = load()
             items.removeAll { $0.vaultId == item.vaultId }
             items.append(item)
             if items.count > Self.maxQueueSize { items.removeFirst(items.count - Self.maxQueueSize) }
-            save(items)
+            try save(items)
         }
     }
 
     /// Remove a successfully-delivered check-in from the queue.
-    func delete(_ item: PendingCheckIn) {
-        queue.sync {
+    func delete(_ item: PendingCheckIn) throws {
+        try queue.sync {
             var items = load()
             items.removeAll { $0.vaultId == item.vaultId }
-            save(items)
+            try save(items)
         }
     }
 
     /// Wipe the entire queue (used in tests and on sign-out).
-    func deleteAll() {
-        queue.sync { save([]) }
+    func deleteAll() throws {
+        try queue.sync { try save([]) }
     }
 
     // MARK: - Private helpers
@@ -116,11 +118,20 @@ final class PendingCheckInStore {
         return []
     }
 
-    private func save(_ items: [PendingCheckIn]) {
+    private func save(_ items: [PendingCheckIn]) throws {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = .prettyPrinted
-        guard let data = try? encoder.encode(items) else { return }
-        try? data.write(to: fileURL, options: .atomic)
+        let data = try encoder.encode(items)
+        // The queue holds vault IDs and check-in data while the device may be locked,
+        // so write it with explicit file protection rather than the default class.
+        // Fall back to `.completeFileProtectionUnlessOpen` only where the platform
+        // requires it (e.g. the file must remain writable while the device is locked).
+        do {
+            try data.write(to: fileURL, options: [.atomic, .completeFileProtection])
+        } catch let error as NSError where error.domain == NSCocoaErrorDomain
+            && (error.code == NSFileWriteNoPermissionError || error.code == NSFileWriteFileExistsError) {
+            try data.write(to: fileURL, options: [.atomic, .completeFileProtectionUnlessOpen])
+        }
     }
 }

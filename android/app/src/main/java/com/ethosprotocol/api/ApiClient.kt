@@ -70,14 +70,20 @@ class ApiClient(
     // which is what's injected here for testability.
     engine: HttpClientEngine = Android.create {
         sslManager = { httpsURLConnection ->
+            // #592: Fail closed. If the system TrustManager can't be obtained we cannot
+            // install PinningTrustManager, and silently falling back to the platform
+            // default would leave the connection with no pinning at all. Throw instead so
+            // engine construction (and therefore the app's networking) fails loudly.
             val systemTm = getSystemTrustManager()
-            if (systemTm != null) {
-                val pinner = CertificatePinner()
-                val pinningTm = PinningTrustManager(pinner, systemTm)
-                val sslContext = SSLContext.getInstance("TLS")
-                sslContext.init(null, arrayOf<TrustManager>(pinningTm), null)
-                httpsURLConnection.sslSocketFactory = sslContext.socketFactory
-            }
+                ?: throw IllegalStateException(
+                    "Unable to obtain the system X509TrustManager; refusing to proceed " +
+                        "without certificate pinning (#592)."
+                )
+            val pinner = CertificatePinner()
+            val pinningTm = PinningTrustManager(pinner, systemTm)
+            val sslContext = SSLContext.getInstance("TLS")
+            sslContext.init(null, arrayOf<TrustManager>(pinningTm), null)
+            httpsURLConnection.sslSocketFactory = sslContext.socketFactory
         }
     },
     private val retryPolicy: RetryPolicy = RetryPolicy.networkDefault,
@@ -160,10 +166,13 @@ class ApiClient(
      * Continue while [VaultPage.hasMore] == true.
      */
     suspend fun listVaults(limit: Int = 20, after: String? = null): ApiResult<VaultPage> {
-        val path = buildString {
-            append("/vaults?limit=$limit")
-            if (after != null) append("&after=$after")
-        }
+        // Cursors are opaque server-issued strings, so they must be percent-encoded:
+        // a raw cursor containing '&', '+', '=' or '#' would otherwise alter the query
+        // and silently skip or repeat results on the next page.
+        val path = URLBuilder("/vaults").apply {
+            parameters.append("limit", limit.toString())
+            if (after != null) parameters.append("after", after)
+        }.buildString()
         return get(path)
     }
     suspend fun getVault(id: String): ApiResult<Vault> = get("/vaults/$id")

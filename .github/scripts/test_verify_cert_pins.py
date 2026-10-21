@@ -6,6 +6,7 @@ Run with: python3 .github/scripts/test_verify_cert_pins.py
 
 import base64
 import hashlib
+import json
 import os
 import sys
 import tempfile
@@ -52,13 +53,17 @@ class VerifyCertPinsTest(unittest.TestCase):
         return path
 
     def verify(self, build_type="release", build_config="", source=PLACEHOLDER_SOURCE,
-               warn_if_unconfigured=False):
+               warn_if_unconfigured=False, shared_pins=None):
         return verify_cert_pins.verify(
             build_type,
             self.write("BuildConfig.java", build_config_with(build_config)),
             self.write("CertificatePinning.kt", source),
             warn_if_unconfigured,
+            shared_pins_path=self.write_shared_pins(shared_pins) if shared_pins is not None else None,
         )
+
+    def write_shared_pins(self, pins):
+        return self.write("cert-pins.json", json.dumps({"pins": list(pins)}))
 
     def test_placeholder_default_pins_fail_release(self):
         self.assertEqual(1, self.verify())
@@ -98,6 +103,36 @@ class VerifyCertPinsTest(unittest.TestCase):
     def test_configured_placeholder_still_fails_when_warn_requested(self):
         # An explicitly configured pin set is always gated hard, however the build is run.
         self.assertEqual(1, self.verify(build_config="PLACEHOLDER", warn_if_unconfigured=True))
+
+    def test_build_config_matching_shared_pins_passes_release(self):
+        pins = [real_pin("current"), real_pin("backup")]
+        self.assertEqual(
+            0,
+            self.verify(build_config=",".join(pins), shared_pins=pins),
+        )
+
+    def test_build_config_drifting_from_shared_pins_fails_release(self):
+        shared = [real_pin("current"), real_pin("backup")]
+        drifted = [real_pin("current"), real_pin("rotated")]
+        self.assertEqual(
+            1,
+            self.verify(build_config=",".join(drifted), shared_pins=shared),
+        )
+
+    def test_build_config_missing_shared_pin_fails_release(self):
+        shared = [real_pin("current"), real_pin("backup")]
+        self.assertEqual(
+            1,
+            self.verify(build_config=real_pin("current"), shared_pins=shared),
+        )
+
+    def test_build_config_drift_is_not_gated_for_debug(self):
+        # Drift is only a release gate; debug builds may pin a local/dev host.
+        shared = [real_pin("current"), real_pin("backup")]
+        self.assertEqual(
+            0,
+            self.verify(build_type="debug", build_config=real_pin("rotated"), shared_pins=shared),
+        )
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 import UIKit
 import Foundation
+import UniformTypeIdentifiers
 
 // MARK: - #270 SensitiveClipboard
 
@@ -27,8 +28,20 @@ enum SensitiveClipboard {
     /// `clearDelaySeconds`. A subsequent call before the timer fires will restart
     /// the timer for the new value — only the most-recent copy is ever pending.
     static func copy(_ value: String) {
-        UIPasteboard.general.string = value
+        UIPasteboard.general.setItems(
+            [[UTType.utf8PlainText.identifier: value]],
+            options: pasteboardOptions(expiresIn: clearDelaySeconds)
+        )
         scheduleClear(after: clearDelaySeconds)
+    }
+
+    /// Options applied to every sensitive copy: the entry expires after `delay`
+    /// and is kept off Universal Clipboard so it does not sync to other devices.
+    static func pasteboardOptions(expiresIn delay: TimeInterval) -> [UIPasteboard.OptionsKey: Any] {
+        [
+            .expirationDate: Date().addingTimeInterval(delay),
+            .localOnly: true
+        ]
     }
 
     // MARK: - Internals

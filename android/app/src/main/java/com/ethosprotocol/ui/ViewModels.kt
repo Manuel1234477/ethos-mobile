@@ -468,6 +468,7 @@ class TwoFactorViewModel @Inject constructor(
         _state.update { it.copy(switchResponse = null) }
     }
 
+    // #120: Require biometric authentication before disabling 2FA (more security-sensitive than check-in)
     fun disable2FA(vaultId: String) = viewModelScope.launch {
         _state.update { it.copy(isLoading = true, error = null) }
         when (val result = apiClient.disable2FA(vaultId)) {
@@ -477,10 +478,9 @@ class TwoFactorViewModel @Inject constructor(
         }
     }
 
-    // #120: Called only after successful BiometricHelper authentication in the screen layer.
+    // Called only after successful BiometricHelper authentication in the screen layer.
     // Keeping the biometric prompt in the screen (where a FragmentActivity is available)
-    // and the network call here (in the ViewModel) matches the same pattern used for check-in
-    // in VaultListScreen and avoids threading BiometricHelper through the ViewModel's DI graph.
+    // and the network call here (in the ViewModel) matches the same pattern used for check-in.
     fun disable2FAAfterBiometric(vaultId: String) = disable2FA(vaultId)
 
     // ── #119 internals ────────────────────────────────────────────────────────

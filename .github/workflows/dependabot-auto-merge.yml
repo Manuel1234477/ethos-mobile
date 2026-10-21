@@ -42,7 +42,7 @@ jobs:
 
     steps:
       - name: Check out pull request merge ref
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -50,13 +50,13 @@ jobs:
       # Dependabot PR payload itself — no registry or alert API access needed.
       - name: Fetch Dependabot metadata
         id: metadata
-        uses: dependabot/fetch-metadata@v2
+        uses: dependabot/fetch-metadata@v3
         with:
           github-token: "${{ secrets.GITHUB_TOKEN }}"
 
       - name: Skip non-patch updates
         if: steps.metadata.outputs.update-type != 'version-update:semver-patch'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const type = '${{ steps.metadata.outputs.update-type }}' || 'unknown';

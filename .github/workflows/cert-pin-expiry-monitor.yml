@@ -23,18 +23,33 @@ defaults:
   run:
     working-directory: .
 
+# Read-only by default. A job that needs more scope must say so itself.
+permissions:
+  contents: read
+
 jobs:
   check-cert-expiry:
     name: Check Pinned Certificate Expiry
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
+
+      # #593: shared/cert-pins.json is the single source of truth for the pin set.
+      # Both platform inputs (Android BuildConfig CERT_PINS and iOS Info.plist
+      # TLS_PUBLIC_KEY_PINS) are generated from it. Fail the job if either
+      # generated value has drifted from the shared source, so a pin rotation
+      # can never land in only one place.
+      - name: Verify certificate pins are in sync
+        run: |
+          python3 .github/scripts/generate_cert_pins.py --check
+          python3 .github/scripts/check_tls_pinning.py
+          python3 .github/scripts/verify_cert_pins.py
 
       # The monitoring script needs openssl and Python's ssl module (stdlib).
       # Both are available on ubuntu-latest without additional installation.
@@ -76,7 +91,7 @@ jobs:
       # even when the step above continues-on-error.
       - name: Upload expiry report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cert-expiry-report-${{ github.run_id }}
           path: cert-expiry-report.json
