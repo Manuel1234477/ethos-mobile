@@ -145,17 +145,23 @@ fi
 # POST /vaults/{id}/checkin with required anti-replay headers (X-Nonce, X-Timestamp
 # per api-contract.md §Anti-Replay Protection) must return 200.
 echo "== 4/5: check-in (POST /vaults/${STAGING_SMOKE_VAULT_ID}/checkin) =="
-nonce=$(openssl rand -hex 32)
-timestamp=$(date +%s)
-status=$(request POST "/vaults/${STAGING_SMOKE_VAULT_ID}/checkin" \
-  -H "Content-Type: application/json" \
-  -H "X-Nonce: ${nonce}" \
-  -H "X-Timestamp: ${timestamp}" \
-  -d '{}')
-if [ "$status" != "200" ]; then
-  fail "POST /vaults/${STAGING_SMOKE_VAULT_ID}/checkin returned $status: $(cat "$BODY_FILE")"
+# A check-in extends the vault's TTL, which other staging tests may depend on. It runs
+# only when STAGING_SMOKE_ALLOW_CHECKIN=1 is set for a vault created for this purpose.
+if [ "${STAGING_SMOKE_ALLOW_CHECKIN:-0}" != "1" ]; then
+  echo "SKIP: set STAGING_SMOKE_ALLOW_CHECKIN=1 to run check-in against a dedicated vault"
 else
-  pass "$status"
+  nonce=$(openssl rand -hex 32)
+  timestamp=$(date +%s)
+  status=$(request POST "/vaults/${STAGING_SMOKE_VAULT_ID}/checkin" \
+    -H "Content-Type: application/json" \
+    -H "X-Nonce: ${nonce}" \
+    -H "X-Timestamp: ${timestamp}" \
+    -d '{}')
+  if [ "$status" != "200" ]; then
+    fail "POST /vaults/${STAGING_SMOKE_VAULT_ID}/checkin returned $status: $(cat $BODY_FILE)"
+  else
+    pass "$status"
+  fi
 fi
 
 # ── 5/5: Push notification registration ──────────────────────────────────────
@@ -164,18 +170,34 @@ fi
 # it only needs to accept and store it. This catches API contract drift in the
 # notifications endpoint (e.g. a changed required field) before it hits production.
 echo "== 5/5: push notification registration (POST /notifications/register) =="
-nonce=$(openssl rand -hex 32)
-timestamp=$(date +%s)
-status=$(request POST /notifications/register \
-  -H "Content-Type: application/json" \
-  -H "X-Nonce: ${nonce}" \
-  -H "X-Timestamp: ${timestamp}" \
-  -d "{\"token\": \"${PUSH_TOKEN}\", \"platform\": \"ios\"}")
-if [ "$status" != "200" ] && [ "$status" != "204" ]; then
-  fail "POST /notifications/register returned $status: $(cat "$BODY_FILE")"
-else
-  pass "$status"
-fi
+for platform in ${SMOKE_PLATFORMS:-ios android}; do
+  nonce=$(openssl rand -hex 32)
+  timestamp=$(date +%s)
+  status=$(request POST /notifications/register \
+    -H "Content-Type: application/json" \
+    -H "X-Nonce: ${nonce}" \
+    -H "X-Timestamp: ${timestamp}" \
+    -d "{\"token\": \"${PUSH_TOKEN}\", \"platform\": \"${platform}\"}")
+  if [ "$status" != "200" ] && [ "$status" != "204" ]; then
+    fail "POST /notifications/register ($platform) returned $status: $(cat $BODY_FILE)"
+  else
+    pass "$status ($platform)"
+  fi
+
+  # Remove the dummy registration so staging does not accumulate device records.
+  nonce=$(openssl rand -hex 32)
+  timestamp=$(date +%s)
+  status=$(request DELETE /notifications/register \
+    -H "Content-Type: application/json" \
+    -H "X-Nonce: ${nonce}" \
+    -H "X-Timestamp: ${timestamp}" \
+    -d "{\"token\": \"${PUSH_TOKEN}\"}")
+  if [ "$status" != "200" ] && [ "$status" != "204" ]; then
+    fail "DELETE /notifications/register ($platform) returned $status: $(cat $BODY_FILE)"
+  else
+    pass "$status (unregister $platform)"
+  fi
+done
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
