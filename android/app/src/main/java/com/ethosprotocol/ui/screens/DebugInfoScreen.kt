@@ -1,7 +1,5 @@
 package com.ethosprotocol.ui.screens
 
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -19,7 +17,9 @@ import androidx.compose.ui.unit.dp
 import com.ethosprotocol.BuildConfig
 import com.ethosprotocol.api.CacheTelemetry
 import com.ethosprotocol.api.NetworkMonitor
+import com.ethosprotocol.security.LogRedactor
 import com.ethosprotocol.services.PendingActionSyncWorker
+import com.ethosprotocol.services.SensitiveClipboard
 import com.ethosprotocol.utils.StartupPerformance
 import kotlinx.coroutines.flow.map
 
@@ -100,8 +100,7 @@ fun DebugInfoScreen(
                 actions = {
                     IconButton(
                         onClick = {
-                            val clipboard = context.getSystemService(ClipboardManager::class.java)
-                            clipboard.setPrimaryClip(ClipData.newPlainText("debug_info", debugText))
+                            SensitiveClipboard.copy(context, LogRedactor.redactString(debugText), label = "debug_info")
                         },
                         modifier = Modifier.testTag("debugInfoCopy")
                     ) {
