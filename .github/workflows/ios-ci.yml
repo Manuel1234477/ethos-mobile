@@ -205,7 +205,7 @@ jobs:
 
       - name: Upload iOS coverage to Codecov
         if: always()
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v7
         with:
           files: ios/EthosProtocol/coverage.lcov
           flags: ios
