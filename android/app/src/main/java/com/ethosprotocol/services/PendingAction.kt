@@ -39,7 +39,11 @@ data class PendingAction(
     // deleted. If the process dies in that window, the next run sees synced == true and
     // knows this row already succeeded — it just finishes the delete without resubmitting
     // the request or double-counting it in sync diagnostics.
-    val synced: Boolean = false
+    val synced: Boolean = false,
+    // Set when a row is found to be malformed (e.g. a required field is null after a
+    // migration or partial write). Dead-lettered rows are skipped by the sync worker so a
+    // single bad row cannot block the rest of the queue on every run.
+    val deadLetter: Boolean = false
 )
 
 @Dao
@@ -58,6 +62,9 @@ interface PendingActionDao {
 
     @Query("UPDATE pending_actions SET synced = 1 WHERE id = :id")
     suspend fun markSynced(id: Long)
+
+    @Query("UPDATE pending_actions SET deadLetter = 1 WHERE id = :id")
+    suspend fun markDeadLetter(id: Long)
 
     @Query("DELETE FROM pending_actions")
     suspend fun deleteAll()
