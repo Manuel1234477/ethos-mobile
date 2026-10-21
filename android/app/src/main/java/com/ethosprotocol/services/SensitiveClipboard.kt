@@ -1,8 +1,11 @@
 package com.ethosprotocol.services
 
 import android.content.ClipData
+import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.Context
+import android.os.Build
+import android.os.PersistableBundle
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -42,6 +45,12 @@ object SensitiveClipboard {
     fun copy(context: Context, value: String, label: String = "Sensitive data") {
         val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         val clip = ClipData.newPlainText(label, value)
+        if (shouldMarkSensitive(Build.VERSION.SDK_INT)) {
+            // Android 13+ hides sensitive clips from the system clipboard preview.
+            clip.description.extras = PersistableBundle().apply {
+                putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true)
+            }
+        }
         clipboard.setPrimaryClip(clip)
 
         // Cancel any in-flight clear and restart the timer.
@@ -60,6 +69,10 @@ object SensitiveClipboard {
             }
         }
     }
+
+    /** True when the platform supports [ClipDescription.EXTRA_IS_SENSITIVE] (API 33+). */
+    internal fun shouldMarkSensitive(sdkInt: Int): Boolean =
+        sdkInt >= Build.VERSION_CODES.TIRAMISU
 
     /**
      * Returns true only when the clipboard still holds [copiedValue], so the

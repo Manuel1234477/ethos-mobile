@@ -69,4 +69,15 @@ class SensitiveClipboardTest {
     fun `shouldClear preserves an empty clipboard`() {
         assertFalse(SensitiveClipboard.shouldClear(currentClip = null, copiedValue = "secret"))
     }
+
+    @Test
+    fun `shouldMarkSensitive is false below Android 13`() {
+        assertFalse(SensitiveClipboard.shouldMarkSensitive(32))
+    }
+
+    @Test
+    fun `shouldMarkSensitive is true from Android 13 (API 33)`() {
+        assertTrue(SensitiveClipboard.shouldMarkSensitive(33))
+        assertTrue(SensitiveClipboard.shouldMarkSensitive(35))
+    }
 }
