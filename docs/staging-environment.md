@@ -280,3 +280,12 @@ cd ios/EthosProtocol && mkdir -p Xcode && xcodegen generate --project Xcode
 
 **Android staging APK points at production URL:**
 Confirm `STAGING_API_BASE_URL` is set in the environment when running `assembleStaging`, or in `~/.gradle/gradle.properties` locally. The value is baked into `BuildConfig.API_BASE_URL` at compile time; installing the APK without rebuilding will keep the old URL.
+
+## Dedicated smoke vault (#572)
+
+The smoke test checks in to `STAGING_SMOKE_VAULT_ID` only when `STAGING_SMOKE_ALLOW_CHECKIN=1`,
+because a check-in extends the vault's TTL for every other test that uses it.
+
+1. Create a vault in staging that is used only by the smoke test.
+2. Set `STAGING_SMOKE_VAULT_ID` to that vault and `STAGING_SMOKE_ALLOW_CHECKIN=1` for the smoke job.
+3. Delete the vault after the smoke run. Deleting it on teardown keeps staging free of stale vaults.

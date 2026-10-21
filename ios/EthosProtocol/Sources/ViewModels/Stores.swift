@@ -38,7 +38,12 @@ final class AuthStore: ObservableObject {
     // ASAuthorizationController-driven ceremonies can't run in a unit test, so AuthStore's
     // own orchestration (single ceremony on register, proactive refresh scheduling,
     // delete-and-reauth fallback) is exercised against these instead.
-    var passkeyRegister: (String) async throws -> AuthToken = { try await PasskeyService.shared.register(username: $0) }
+    // Registration now also yields the server-issued opaque WebAuthn user handle
+    // (#624). It is persisted so the same handle is reused for every subsequent
+    // ceremony on this account, rather than one derived from the username.
+    var passkeyRegister: (String) async throws -> PasskeyRegistrationResult = {
+        try await PasskeyService.shared.register(username: $0)
+    }
     var passkeyAuthenticate: () async throws -> AuthToken = { try await PasskeyService.shared.authenticate() }
     var refreshToken: () async throws -> AuthToken = { try await APIClient.shared.refreshToken() }
     var linkAdditionalPasskey: (String, AccountRecoveryProof) async throws -> String = { username, proof in
@@ -78,7 +83,11 @@ final class AuthStore: ObservableObject {
     func register(username: String) async {
         isLoading = true; error = nil
         do {
-            let token = try await passkeyRegister(username)
+            let result = try await passkeyRegister(username)
+            // Persist the opaque user handle before anything else so it survives a
+            // crash between registration and the first authenticated request.
+            KeychainService.shared.saveUserHandle(result.userHandle)
+            let token = result.token
             KeychainService.shared.saveToken(token.token, expiresAt: token.expiresAt)
             ifNotCancelled {
                 isAuthenticated = true
@@ -128,6 +137,9 @@ final class AuthStore: ObservableObject {
         // this account — a subsequent user signing in on the same device must not inherit
         // them.
         KeychainService.shared.deleteCredentialID()
+        // The opaque WebAuthn user handle (#624) is account-scoped too — clear it so a
+        // subsequent user on this device never reuses the previous account's handle.
+        KeychainService.shared.deleteUserHandle()
         ICloudSyncService.shared.clearLocalAssociations()
         // Ties into #10: a subsequent user signing in on the same device must never be served
         // the previous user's cached vault data while offline.
@@ -323,22 +335,44 @@ final class VaultStore: ObservableObject {
     @Published var sortOption: VaultSortOption = .expiryDate {
         didSet { saveSearchPreferences() }
     }
+    /// Issue #477: filter to vaults carrying this tag, or nil for no tag filter.
+    @Published var tagFilter: String?
 
     private var eventSocket: VaultEventSocket?
+
+    /// Highest `Vault.version` applied per vault ID. A `GET /vaults` poll started before a
+    /// `vault_updated` push can complete after it; without this, the older poll response
+    /// would overwrite the newer pushed state (#606). Any incoming vault whose version is
+    /// not greater than the recorded one is dropped instead of applied.
+    private var appliedVersions: [String: Int] = [:]
 
     /// Whether a further page is available for VaultListView's "Load More".
     var hasMorePages: Bool { nextCursor != nil }
 
-    /// Filtered and sorted vaults based on search text, status filter, and sort option
+    /// Filtered and sorted vaults based on search text, status filter, sort option,
+    /// and (#477) tag filter.
     var filteredAndSortedVaults: [Vault] {
-        vaults
+        // Issue #474: vaults merged away into another vault are hidden from
+        // the main list — they still exist and VaultMergeStore can un-merge
+        // them, but they no longer clutter the primary view.
+        let hidden = VaultMergeStore.hiddenVaultIds()
+        return vaults
             .filter { vault in
+                !hidden.contains(vault.id) &&
                 statusFilter.matches(vault: vault) &&
-                (searchText.isEmpty || vault.id.lowercased().contains(searchText.lowercased()))
+                (searchText.isEmpty || vault.id.lowercased().contains(searchText.lowercased())) &&
+                (tagFilter == nil || VaultTagStore.tags(for: vault.id).contains(tagFilter!))
             }
             .sorted { lhs, rhs in
                 sortOption.compare(lhs: lhs, rhs: rhs)
             }
+    }
+
+    /// Issue #474: duplicate-vault groups (same beneficiary, different vault
+    /// IDs), excluding any pair where one side has already been merged away.
+    var duplicateGroups: [VaultDuplicateGroup] {
+        let hidden = VaultMergeStore.hiddenVaultIds()
+        return VaultDuplicateDetector.findDuplicateGroups(in: vaults.filter { !hidden.contains($0.id) })
     }
 
     init() {
@@ -378,7 +412,7 @@ final class VaultStore: ObservableObject {
             let page = try await APIClient.shared.listVaults()
             ifNotCancelled {
                 let (dedupedVaults, duplicateCount) = deduplicateVaults(page.vaults)
-                vaults = dedupedVaults
+                vaults = mergePolledVaults(dedupedVaults)
                 nextCursor = page.nextCursor
                 if duplicateCount > 0 {
                     let message = duplicateCount == 1
@@ -434,7 +468,7 @@ final class VaultStore: ObservableObject {
             } while cursor != nil
             ifNotCancelled {
                 let (dedupedVaults, duplicateCount) = deduplicateVaults(accumulated)
-                vaults = dedupedVaults
+                vaults = mergePolledVaults(dedupedVaults)
                 if duplicateCount > 0 {
                     let message = duplicateCount == 1
                         ? "Removed 1 duplicate vault from your list"
@@ -463,13 +497,24 @@ final class VaultStore: ObservableObject {
             // overload — pin the reference to the original before calling it.
             let performCheckIn: (String, String?) async throws -> Void = APIClient.shared.checkIn(vaultID:idempotencyKey:)
             try await performCheckIn(vault.id, idempotencyKey)
+            VaultActionLog.record(.checkIn, for: vault.id) // #479
             if !Task.isCancelled { await load() }
         } catch APIError.networkUnavailable {
             // Offline: queue the check-in durably so it is retried when connectivity
             // returns, mirroring Android's VaultViewModel.checkIn → PendingCheckInDao
             // + CheckInSyncWorker pattern.
             let item = PendingCheckIn(vaultId: vault.id, queuedAt: Date(), idempotencyKey: idempotencyKey)
-            PendingCheckInStore.shared.insert(item)
+            do {
+                // A check-in is the most time-sensitive action the app queues, so a failed
+                // write must not be swallowed (#615): surface it as a blocking alert rather
+                // than letting the user believe the check-in is safely queued.
+                try PendingCheckInStore.shared.insert(item)
+            } catch {
+                ifNotCancelled {
+                    self.error = ErrorPresentation(message: "Offline — your check-in could not be saved and was not queued. Please try again.")
+                }
+                return
+            }
             let count = PendingCheckInStore.shared.count
             NotificationService.shared.showQueuedCheckIn(count: count)
             CheckInSyncTask.shared.scheduleSync()
@@ -487,6 +532,7 @@ final class VaultStore: ObservableObject {
         error = nil
         do {
             _ = try await APIClient.shared.deposit(vaultID: vault.id, amount: amount)
+            VaultActionLog.record(.deposit, for: vault.id) // #479
             if !Task.isCancelled { await load() }
         } catch {
             ifNotCancelled { self.error = ErrorPresentation(error) }
@@ -499,6 +545,7 @@ final class VaultStore: ObservableObject {
         error = nil
         do {
             _ = try await APIClient.shared.withdraw(vaultID: vault.id, amount: amount)
+            VaultActionLog.record(.withdraw, for: vault.id) // #479
             if !Task.isCancelled { await load() }
         } catch {
             ifNotCancelled { self.error = ErrorPresentation(error) }
@@ -521,17 +568,46 @@ final class VaultStore: ObservableObject {
     /// appends it if it isn't currently in `vaults` — e.g. a vault created from another
     /// device that this session hasn't loaded yet.
     ///
-    /// Called for a `vault_updated` push (`subscribeToEvents`). `load`/`loadAll` achieve
-    /// the same outcome for a poll by replacing `vaults` wholesale — either way, whichever
-    /// of a poll or a push is *received* last simply overwrites what was there, with no
-    /// comparison against it. See the "Reconciling a poll/push disagreement" rule in
-    /// api-contract.md (#223).
+    /// Called for a `vault_updated` push (`subscribeToEvents`). Ignores the update if a
+    /// newer version has already been applied, so an out-of-order push can't regress state.
+    /// See the "Reconciling a poll/push disagreement" rule in api-contract.md (#223, #606).
     func applyUpdate(_ updated: Vault) {
+        guard isNewer(updated) else { return }
+        recordApplied(updated)
         if let index = vaults.firstIndex(where: { $0.id == updated.id }) {
             vaults[index] = updated
         } else {
             vaults.append(updated)
         }
+    }
+
+    /// Merges a polled page into `vaults`, keeping whichever side has the higher version for
+    /// each vault. A poll response that started before a `vault_updated` push but completed
+    /// after it carries older data; dropping it here prevents the stale overwrite (#606).
+    private func mergePolledVaults(_ polled: [Vault]) -> [Vault] {
+        var merged: [Vault] = []
+        merged.reserveCapacity(polled.count)
+        for incoming in polled {
+            if let existing = vaults.first(where: { $0.id == incoming.id }), !isNewer(incoming) {
+                // The already-applied copy is at least as new — keep it.
+                merged.append(existing)
+            } else {
+                recordApplied(incoming)
+                merged.append(incoming)
+            }
+        }
+        return merged
+    }
+
+    /// Whether `incoming` is strictly newer than the version already applied for its vault.
+    /// Vaults never seen before are always accepted.
+    private func isNewer(_ incoming: Vault) -> Bool {
+        guard let applied = appliedVersions[incoming.id] else { return true }
+        return incoming.version > applied
+    }
+
+    private func recordApplied(_ vault: Vault) {
+        appliedVersions[vault.id] = max(appliedVersions[vault.id] ?? vault.version, vault.version)
     }
 
     /// Subscribes to real-time vault events (#20) and applies incoming updates to
@@ -584,6 +660,12 @@ final class VaultStore: ObservableObject {
         socketConnectionState = .disconnected
     }
 
+    /// Clears the per-vault applied-version bookkeeping. Called on sign-out so a subsequent
+    /// user on the same device isn't served stale comparisons from the previous account.
+    func resetVersionTracking() {
+        appliedVersions.removeAll()
+    }
+
     private func deduplicateVaults(_ vaults: [Vault]) -> (deduplicated: [Vault], duplicateCount: Int) {
         var seenIDs = Set<String>()
         var deduplicated: [Vault] = []
@@ -612,6 +694,34 @@ final class VaultStore: ObservableObject {
         }
     }
 }
+
+// MARK: - #606 Stale poll/push reconciliation
+
+#if DEBUG
+/// Exercises the out-of-order race from #606: a `GET /vaults` poll started before a
+/// `vault_updated` push, completing after it, must not overwrite the newer pushed state.
+enum VaultStoreVersionRaceTests {
+    @MainActor
+    static func run() {
+        let store = VaultStore()
+        let stale = Vault.fixture(id: "v1", version: 1, balance: 100)
+        let fresh = Vault.fixture(id: "v1", version: 2, balance: 200)
+
+        // Push arrives first with the newer version.
+        store.applyUpdate(fresh)
+        assert(store.vaults.first?.balance == 200, "push should apply")
+
+        // Stale poll response completes afterwards — must be ignored.
+        store.applyUpdate(stale)
+        assert(store.vaults.first?.balance == 200, "stale push must not overwrite newer state")
+
+        // A newer push still applies.
+        let newer = Vault.fixture(id: "v1", version: 3, balance: 300)
+        store.applyUpdate(newer)
+        assert(store.vaults.first?.balance == 300, "newer push should apply")
+    }
+}
+#endif
 
 // MARK: - #120 Disable2FACoordinator
 

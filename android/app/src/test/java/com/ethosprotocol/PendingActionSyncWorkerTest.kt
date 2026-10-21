@@ -1,6 +1,17 @@
 package com.ethosprotocol
 
 import android.content.Context
+import androidx.room.testing.MigrationTestHelper
+import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
+import com.ethosprotocol.services.PendingActionDatabase
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Rule
+import org.junit.Test
+import org.junit.runner.RunWith
 import androidx.work.ListenableWorker
 import androidx.work.WorkerParameters
 import com.ethosprotocol.api.ApiClient
@@ -146,6 +157,70 @@ class PendingActionSyncWorkerTest {
     }
 
     @Test
+    fun `check-in row with null vaultId is dead-lettered without calling the api`() = runTest {
+        val bad = PendingAction(
+            id = 1,
+            type = PendingActionType.CHECK_IN,
+            vaultId = null,
+            queuedAt = 1L
+        )
+        coEvery { dao.getAll() } returnsMany listOf(listOf(bad), emptyList())
+        coEvery { dao.markDeadLetter(any(), any()) } just Runs
+        coEvery { dao.delete(any()) } just Runs
+
+        val result = worker.doWork()
+
+        assertEquals(ListenableWorker.Result.success(), result)
+        coVerify(exactly = 0) { apiClient.checkIn(any(), any()) }
+        coVerify { dao.markDeadLetter(bad.id, any()) }
+        coVerify(exactly = 0) { dao.markSynced(any()) }
+    }
+
+    @Test
+    fun `create-vault row with null payloadJson is dead-lettered without calling the api`() = runTest {
+        val bad = PendingAction(
+            id = 2,
+            type = PendingActionType.CREATE_VAULT,
+            payloadJson = null,
+            queuedAt = 2L
+        )
+        coEvery { dao.getAll() } returnsMany listOf(listOf(bad), emptyList())
+        coEvery { dao.markDeadLetter(any(), any()) } just Runs
+        coEvery { dao.delete(any()) } just Runs
+
+        val result = worker.doWork()
+
+        assertEquals(ListenableWorker.Result.success(), result)
+        coVerify(exactly = 0) { apiClient.createVault(any(), any()) }
+        coVerify { dao.markDeadLetter(bad.id, any()) }
+        coVerify(exactly = 0) { dao.markSynced(any()) }
+    }
+
+    @Test
+    fun `malformed row does not block a subsequent valid row in the same run`() = runTest {
+        val bad = PendingAction(
+            id = 1,
+            type = PendingActionType.CHECK_IN,
+            vaultId = null,
+            queuedAt = 1L
+        )
+        val good = checkInAction("v1").copy(id = 2)
+        coEvery { dao.getAll() } returnsMany listOf(listOf(bad, good), emptyList())
+        coEvery { dao.markDeadLetter(any(), any()) } just Runs
+        coEvery { apiClient.checkIn("v1", good.idempotencyKey) } returns ApiResult.Success(Unit)
+        coEvery { dao.markSynced(good.id) } just Runs
+        coEvery { dao.delete(any()) } just Runs
+
+        val result = worker.doWork()
+
+        assertEquals(ListenableWorker.Result.success(), result)
+        coVerify { dao.markDeadLetter(bad.id, any()) }
+        coVerify { apiClient.checkIn("v1", good.idempotencyKey) }
+        coVerify { dao.markSynced(good.id) }
+        coVerify { dao.delete(good) }
+    }
+
+    @Test
     fun `mixed check-in and create-vault items are both dispatched and removed on success`() = runTest {
         val checkIn = checkInAction("v1")
         val vaultReq = CreateVaultRequest("GXYZ", 2_592_000L)
@@ -183,4 +258,54 @@ class PendingActionSyncWorkerTest {
         lastCheckIn = "2026-04-01T00:00:00Z", ttlRemaining = 2_592_000L,
         status = VaultStatus.active
     )
+}
+
+@RunWith(AndroidJUnit4::class)
+class PendingActionDatabaseMigrationTest {
+
+    private val testDbName = "pending-action-migration-test.db"
+
+    @get:Rule
+    val helper = MigrationTestHelper(
+        InstrumentationRegistry.getInstrumentation(),
+        PendingActionDatabase::class.java,
+        emptyList(),
+        FrameworkSQLiteOpenHelperFactory()
+    )
+
+    @Test
+    fun migrate1To2_preservesQueuedActionsAndPopulatesNewColumns() {
+        helper.createDatabase(testDbName, 1).apply {
+            execSQL(
+                "INSERT INTO pending_actions (id, type, vaultId, payloadJson, queuedAt, dedupeKey) " +
+                    "VALUES (1, 'CHECK_IN', 'v1', NULL, 1, 'check_in:v1')"
+            )
+            close()
+        }
+
+        val db = helper.runMigrationsAndValidate(
+            testDbName,
+            2,
+            true,
+            PendingActionDatabase.MIGRATION_1_2
+        )
+
+        db.query(
+            "SELECT id, type, vaultId, queuedAt, dedupeKey, idempotencyKey, synced " +
+                "FROM pending_actions WHERE id = 1"
+        ).use { cursor ->
+            assertEquals(1, cursor.count)
+            cursor.moveToFirst()
+            assertEquals(1, cursor.getInt(0))
+            assertEquals("CHECK_IN", cursor.getString(1))
+            assertEquals("v1", cursor.getString(2))
+            assertEquals(1L, cursor.getLong(3))
+            assertEquals("check_in:v1", cursor.getString(4))
+            assertNotNull(cursor.getString(5))
+            assertFalse(cursor.isNull(5))
+            assertEquals(0, cursor.getInt(6))
+        }
+
+        db.close()
+    }
 }

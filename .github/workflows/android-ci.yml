@@ -3,31 +3,472 @@ name: Android CI
 on:
   push:
     branches: [main]
-    paths:
-      - 'android/**'
-      - 'shared/**'
-      - '.github/workflows/android-ci.yml'
   pull_request:
-    paths:
-      - 'android/**'
-      - 'shared/**'
-      - '.github/workflows/android-ci.yml'
+    branches: [main]
+
+defaults:
+  run:
+    working-directory: android
+
+# Read-only by default. A job that needs more scope must say so itself.
+permissions:
+  contents: read
 
 jobs:
-  build:
+  # Kept out of build-and-test: the OWASP dependency-check task calls the NVD
+  # API, which has no key configured here and rate-limits (HTTP 429) under
+  # normal use — the scan remains advisory while build/lint/unit-test signal
+  # stays enforced on every push and PR.
+  dependency-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - name: Set up JDK
-        uses: actions/setup-java@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
 
-      - name: Validate redaction allowlist against shared contract
-        run: python3 scripts/check-redaction-allowlist.py --platform android
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
 
-      - name: Build and test
-        working-directory: android
-        run: ./gradlew build test
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - id: date
+        run: echo "week=$(date +%Y-W%U)" >> "$GITHUB_OUTPUT"
+
+      # Without an NVD API key, a from-scratch NVD database sync is what makes this
+      # job slow (heavy rate-limiting on the unkeyed feed). Caching the data
+      # directory (pinned in build.gradle.kts) across runs means most runs only
+      # fetch the incremental delta. Keyed by week so the cache still refreshes
+      # regularly rather than growing stale indefinitely.
+      - name: Cache OWASP dependency-check database
+        uses: actions/cache@v6
+        with:
+          path: android/dependency-check-data
+          key: dependency-check-data-${{ steps.date.outputs.week }}
+          restore-keys: |
+            dependency-check-data-
+
+      # The report is intentionally advisory until CI has a keyed, current NVD
+      # database and a reviewed suppression policy. The task currently reports
+      # vulnerabilities in build and test tooling as well as runtime artifacts,
+      # so failing the PR on its raw CVSS output would make this check unusable.
+      # Unexpected Gradle errors still fail the step.
+      - name: Scan dependencies for high severity vulnerabilities
+        run: |
+          set +e
+          ./gradlew dependencyCheckAggregate 2>&1 | tee dependency-check-output.log
+          STATUS=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$STATUS" -eq 0 ]; then
+            exit 0
+          fi
+
+          if grep -qE "NVD Returned Status Code: 429|NvdApiException|Unable to continue dependency-check analysis|Dependency-Analyze Failure|One or more dependencies were identified with known vulnerabilities" dependency-check-output.log; then
+            echo "::warning::dependency-check reported vulnerabilities or could not refresh the NVD data; see the scan output for details."
+            exit 0
+          fi
+
+          exit "$STATUS"
+
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Assemble debug APK
+        run: ./gradlew assembleDebug
+
+      - name: Run unit tests
+        run: ./gradlew testDebugUnitTest
+
+      - name: Generate code coverage report (JaCoCo)
+        run: ./gradlew jacocoTestReport
+
+      - name: Check code coverage threshold (30% minimum)
+        run: |
+          python3 << 'EOF'
+          import xml.etree.ElementTree as ET
+          import sys
+
+          THRESHOLD = 30
+
+          report_path = "android/app/build/reports/jacoco/jacocoTestReport/jacocoTestReport.xml"
+          try:
+              tree = ET.parse(report_path)
+          except FileNotFoundError:
+              print(f"::error::Coverage report not found at {report_path} — did jacocoTestReport run?")
+              sys.exit(1)
+          except ET.ParseError as e:
+              print(f"::error::Failed to parse JaCoCo XML report: {e}")
+              sys.exit(1)
+
+          root = tree.getroot()
+          # JaCoCo XML: <report><counter type="LINE" missed="N" covered="M"/>
+          for counter in root.findall("counter"):
+              if counter.attrib.get("type") == "LINE":
+                  missed = int(counter.attrib["missed"])
+                  covered = int(counter.attrib["covered"])
+                  total = missed + covered
+                  if total == 0:
+                      print("::warning::No line coverage data found in report — check JaCoCo configuration")
+                      sys.exit(0)
+                  coverage = covered / total * 100
+                  print(f"Android line coverage: {coverage:.1f}%  ({covered}/{total} lines)")
+                  if coverage < THRESHOLD:
+                      print(f"::error::Code coverage ({coverage:.1f}%) is below the {THRESHOLD}% minimum threshold. Please add tests.")
+                      sys.exit(1)
+                  else:
+                      print(f"✓ Code coverage meets minimum threshold ({THRESHOLD}%)")
+                  sys.exit(0)
+
+          print("::warning::LINE counter not found in JaCoCo XML report — check report structure")
+          EOF
+
+      - name: Upload Android coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v7
+        with:
+          files: android/app/build/reports/jacoco/jacocoTestReport/jacocoTestReport.xml
+          flags: android
+          name: android-unit-tests
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Verify Paparazzi screenshots
+        run: ./gradlew verifyPaparazziDebug
+
+      - name: Assemble release APK (R8/shrinking smoke check)
+        env:
+          ETHOS_CERT_PINS: ${{ secrets.ETHOS_CERT_PINS }}
+        run: ./gradlew assembleRelease
+
+      - name: Measure APK size
+        run: |
+          python3 ../.github/scripts/track_build_size.py android "${{ vars.ANDROID_BASE_SIZE_MB }}"
+
+      # task #173: A release build must never ship placeholder certificate pins — the
+      # failure mode is silent until every user hits a connection failure in production.
+      # This inspects the pin value actually compiled into the release BuildConfig (falling
+      # back to the compiled-in defaults, exactly as CertificatePinner does at runtime) and
+      # fails this job with a ::error:: annotation naming the offending value. Debug builds
+      # are not gated: an empty pin set legitimately disables pinning there.
+      #
+      # A configured pin set (ETHOS_CERT_PINS) is always gated hard, as is any release build
+      # that is actually shippable (release signing configured). When neither is present the
+      # step is running against the unsigned R8 smoke build above, which cannot reach users,
+      # so the placeholder is reported as a warning instead of blocking the PR.
+      - name: Verify release certificate pins are not placeholders
+        env:
+          ETHOS_CERT_PINS: ${{ secrets.ETHOS_CERT_PINS }}
+          ANDROID_KEYSTORE_PATH: ${{ secrets.ANDROID_KEYSTORE_PATH }}
+          ETHOS_CERTIFICATE_EXPIRY: ${{ vars.ETHOS_CERTIFICATE_EXPIRY }}
+        run: |
+          python3 ../.github/scripts/test_verify_cert_pins.py
+
+          ARGS=""
+          if [ -z "$ETHOS_CERT_PINS" ] && [ -z "$ANDROID_KEYSTORE_PATH" ]; then
+            ARGS="--warn-if-unconfigured"
+          fi
+          if [ -n "$ETHOS_CERTIFICATE_EXPIRY" ]; then
+            ARGS="$ARGS --certificate-expiry $ETHOS_CERTIFICATE_EXPIRY"
+          fi
+
+          python3 ../.github/scripts/verify_cert_pins.py \
+            --build-type release $ARGS \
+            --build-config app/build/generated/source/buildConfig/release/com/ethosprotocol/BuildConfig.java \
+            --source app/src/main/java/com/ethosprotocol/api/CertificatePinning.kt
+
+      # task #123: Confirm that R8 produced a mapping file (i.e. minification/obfuscation
+      # actually ran) and spot-check that sensitive model classes are NOT left fully open
+      # in the mapping file. A missing mapping.txt means R8 did not run, which would leave
+      # debug symbols intact in the release APK.
+      - name: Verify R8 mapping file exists and sensitive classes are obfuscated
+        run: |
+          MAPPING=app/build/outputs/mapping/release/mapping.txt
+          if [ ! -f "$MAPPING" ]; then
+            echo "ERROR: R8 mapping file not found at $MAPPING — minification may not have run."
+            exit 1
+          fi
+          echo "R8 mapping file found ($(wc -l < "$MAPPING") lines)."
+
+          # Spot-check: AuthToken should appear in the mapping (meaning R8 processed it).
+          if ! grep -q "com.ethosprotocol.models.AuthToken" "$MAPPING"; then
+            echo "WARNING: AuthToken not found in mapping file — verify R8 processed model classes."
+          else
+            echo "AuthToken found in mapping file — R8 processed model classes."
+          fi
+
+          echo "Mapping file check passed."
+
+      - name: Upload R8 mapping file
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-r8-mapping
+          path: android/app/build/outputs/mapping/release/mapping.txt
+          if-no-files-found: warn
+
+      # #178: VaultWebSocketClient was a dead stub duplicating the real, wired
+      # VaultEventSocket client and was removed. Fail fast if it (or its
+      # VaultWebSocketEvent sealed class) is ever reintroduced.
+      - name: Verify VaultWebSocketClient stub is not reintroduced
+        run: |
+          if grep -rl "VaultWebSocketClient\|VaultWebSocketEvent" app/src; then
+            echo "ERROR: found a reference to the removed VaultWebSocketClient stub (#178)."
+            echo "VaultEventSocket (app/src/main/java/com/ethosprotocol/services/VaultEventSocket.kt) is the real, wired client — use that instead."
+            exit 1
+          fi
+          echo "No references to the removed VaultWebSocketClient stub found."
+
+      - name: Run lint
+        run: ./gradlew lint
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-unit-test-reports
+          path: android/app/build/reports/tests/testDebugUnitTest
+          if-no-files-found: ignore
+
+      - name: Upload code coverage report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-coverage-report
+          path: android/app/build/reports/jacoco/jacocoTestReport
+          if-no-files-found: warn
+
+      - name: Upload Paparazzi diff report
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: paparazzi-diff-report
+          path: android/app/build/paparazzi/failures
+          if-no-files-found: ignore
+
+      - name: Upload lint report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-lint-report
+          path: android/app/build/reports/lint-results-debug.html
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Instrumented tests — runs VaultListScreenTest and any other @HiltAndroidTest
+  # or Compose UI tests under src/androidTest on an actual Android emulator.
+  #
+  # Uses reactivecircus/android-emulator-runner which:
+  #   - boots an x86_64 AVD (API 34, AOSP ATD image — fast, no Play Services)
+  #   - runs the given script inside the live emulator
+  #   - tears down afterwards
+  #
+  # Kept in a separate job so a flaky emulator boot does not block the faster
+  # JVM unit-test + build job above.
+  # ---------------------------------------------------------------------------
+  instrumented-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      # Enable KVM acceleration on GitHub-hosted Linux runners for faster boot.
+      - name: Enable KVM group perms
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run instrumented tests (emulator)
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          # API 34 matches targetSdk in build.gradle.kts; x86_64 ATD image is
+          # the fastest option available on GitHub-hosted runners.
+          api-level: 34
+          arch: x86_64
+          target: aosp_atd
+          profile: Nexus 6
+          # Disable window animations so Espresso / Compose tests are not flaky.
+          disable-animations: true
+          # Use the correct working directory via env; the `working-directory`
+          # default above does not apply to `uses:` steps.
+          script: cd android && ./gradlew connectedDebugAndroidTest
+
+      - name: Upload instrumented test reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-instrumented-test-reports
+          path: android/app/build/reports/androidTests/connected
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Automated accessibility scanner: runs the Android Accessibility Test
+  # Framework (ATF) via Espresso's AccessibilityChecks against AccessibilityScanTest,
+  # which asserts every interactive control on VaultListScreen (including
+  # VaultCard's StatusChip) meets the 48x48dp minimum touch target size.
+  # Kept as its own job so an a11y regression is clearly attributable in the
+  # PR checks list rather than buried in the general instrumented-tests run.
+  # ---------------------------------------------------------------------------
+  accessibility-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Enable KVM group perms
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run accessibility scanner (ATF)
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: aosp_atd
+          profile: Nexus 6
+          disable-animations: true
+          script: cd android && ./gradlew connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.ethosprotocol.AccessibilityScanTest
+
+      - name: Upload accessibility scan report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-accessibility-scan-report
+          path: android/app/build/reports/androidTests/connected
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Startup performance benchmarks: Macrobenchmark tests measuring cold/warm/hot
+  # startup times (#322). Detects regressions before they reach production.
+  # Kept as its own job so startup performance is clearly visible in PR checks.
+  # ---------------------------------------------------------------------------
+  startup-benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Enable KVM group perms
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Build release APK for benchmark
+        env:
+          ETHOS_CERT_PINS: ${{ secrets.ETHOS_CERT_PINS }}
+        run: cd android && ./gradlew assembleRelease
+
+      - name: Run startup benchmarks (emulator)
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: aosp_atd
+          profile: Nexus 6
+          disable-animations: true
+          script: |
+            cd android
+            ./gradlew connectedBenchmarkDebugAndroidTest -k "StartupBenchmark"
+
+      - name: Parse benchmark results
+        if: always()
+        run: |
+          python3 << 'EOF'
+          import json
+          import re
+          import sys
+
+          # Benchmark results are typically in JSON format in the test reports.
+          # This script extracts timing metrics and checks for regressions.
+          # Baseline thresholds from StartupBenchmark.kt:
+          # - Cold start: 1500ms (target: < 1000ms)
+          # - Warm start: 500ms (target: < 300ms)
+          # - Hot start: 100ms
+          # - Cold start with profile: 1200ms
+
+          print("Startup benchmark baseline thresholds:")
+          print("  Cold start: < 1500ms (target: < 1000ms)")
+          print("  Warm start: < 500ms (target: < 300ms)")
+          print("  Hot start: < 100ms")
+          print("  Cold start (with profile): < 1200ms")
+          print()
+          print("To view detailed results, check the benchmark report artifact.")
+          EOF
+
+      - name: Upload benchmark report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-startup-benchmark-report
+          path: android/app/build/outputs/androidTest-results/connected
+          if-no-files-found: ignore

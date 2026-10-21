@@ -15,6 +15,7 @@ import com.ethosprotocol.services.CrashReporter
 import com.ethosprotocol.services.CredentialManagerFactory
 import com.ethosprotocol.services.PendingActionDatabase
 import com.ethosprotocol.services.PendingActionDao
+import com.ethosprotocol.services.PendingActionDatabaseKeyProvider
 import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
@@ -49,8 +50,10 @@ object AppModule {
     ): ApiClient = ApiClient(tokenProvider, networkMonitor, offlineCache, apiBaseUrl)
 
     @Provides @Singleton
-    fun providePendingActionDatabase(@ApplicationContext context: Context): PendingActionDatabase =
-        PendingActionDatabase.create(context)
+    fun providePendingActionDatabase(
+        @ApplicationContext context: Context,
+        keyProvider: PendingActionDatabaseKeyProvider
+    ): PendingActionDatabase = PendingActionDatabase.create(context, keyProvider)
 
     @Provides @Singleton
     fun providePendingActionDao(db: PendingActionDatabase): PendingActionDao =

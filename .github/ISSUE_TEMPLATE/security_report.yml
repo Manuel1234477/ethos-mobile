@@ -1,0 +1,19 @@
+name: Security report
+description: Report a vulnerability in a way that keeps it private until fixed
+labels: ["security"]
+body:
+  - type: markdown
+    attributes:
+      value: "Do not describe an unfixed vulnerability in a public issue. Follow SECURITY.md for private reporting."
+  - type: input
+    id: component
+    attributes:
+      label: Affected component or file
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact
+    validations:
+      required: true

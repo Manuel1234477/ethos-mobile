@@ -1,6 +1,224 @@
 import XCTest
 @testable import EthosProtocol
 
+// MARK: - #620 PIN Attempt Limiting Tests
+
+final class PINAuthenticationServiceLockoutTests: XCTestCase {
+
+    // ── Escalating cooldown from the OTPRateLimiter schedule ───────────────
+
+    @MainActor
+    func test_verifyPIN_below3Failures_noCooldown() async {
+        let service = makeTestService()
+
+        for _ in 1...2 { _ = await service.verifyPIN("0000") }
+
+        XCTAssertEqual(service.failureCount, 2)
+        XCTAssertFalse(service.isLockedOut,
+            "Fewer than 3 failures must not trigger a cooldown")
+        XCTAssertEqual(service.cooldownSecondsRemaining, 0)
+    }
+
+    @MainActor
+    func test_verifyPIN_at3Failures_starts30sCooldown() async {
+        let service = makeTestService()
+
+        for _ in 1...3 { _ = await service.verifyPIN("0000") }
+
+        XCTAssertTrue(service.isLockedOut,
+            "3 failures must start a cooldown")
+        XCTAssertEqual(service.cooldownSecondsRemaining,
+            OTPRateLimiter.cooldownSeconds(for: 3),
+            "PIN cooldown must reuse the OTPRateLimiter schedule")
+        XCTAssertEqual(service.cooldownSecondsRemaining, 30)
+    }
+
+    @MainActor
+    func test_verifyPIN_at4Failures_starts60sCooldown() async {
+        let service = makeTestService()
+
+        for _ in 1...4 { _ = await service.verifyPIN("0000") }
+
+        XCTAssertTrue(service.isLockedOut)
+        XCTAssertEqual(service.cooldownSecondsRemaining,
+            OTPRateLimiter.cooldownSeconds(for: 4))
+        XCTAssertEqual(service.cooldownSecondsRemaining, 60)
+    }
+
+    @MainActor
+    func test_verifyPIN_at5Failures_starts120sCooldown() async {
+        let service = makeTestService()
+
+        for _ in 1...5 { _ = await service.verifyPIN("0000") }
+
+        XCTAssertTrue(service.isLockedOut)
+        XCTAssertEqual(service.cooldownSecondsRemaining,
+            OTPRateLimiter.cooldownSeconds(for: 5))
+        XCTAssertEqual(service.cooldownSecondsRemaining, 120)
+    }
+
+    @MainActor
+    func test_verifyPIN_cooldownCappedAt120s() async {
+        let service = makeTestService()
+
+        for _ in 1...10 { _ = await service.verifyPIN("0000") }
+
+        XCTAssertEqual(service.cooldownSecondsRemaining, 120,
+            "Cooldown must be capped at 120 s regardless of failure count")
+    }
+
+    // ── Rejection while blocked ────────────────────────────────────────────
+
+    @MainActor
+    func test_verifyPIN_whileBlocked_rejectsEvenCorrectPIN() async {
+        let service = makeTestService(pin: "1234")
+
+        for _ in 1...3 { _ = await service.verifyPIN("0000") }
+        XCTAssertTrue(service.isLockedOut, "Precondition: should be locked out")
+
+        let result = await service.verifyPIN("1234")
+
+        XCTAssertFalse(result,
+            "Verification must be rejected while the cooldown is active, even for the correct PIN")
+        XCTAssertEqual(service.failureCount, 3,
+            "Rejected attempts during lockout must not increment the failure counter")
+    }
+
+    @MainActor
+    func test_verifyPIN_afterCooldownElapses_allowsAttempt() async {
+        var fakeNow = Date()
+        let service = makeTestService(pin: "1234", now: { fakeNow })
+
+        for _ in 1...3 { _ = await service.verifyPIN("0000") }
+        XCTAssertTrue(service.isLockedOut)
+
+        fakeNow = fakeNow.addingTimeInterval(31)
+
+        XCTAssertFalse(service.isLockedOut,
+            "Cooldown must expire once the deadline passes")
+        let result = await service.verifyPIN("1234")
+        XCTAssertTrue(result, "Correct PIN must be accepted after the cooldown elapses")
+    }
+
+    // ── Reset on success ───────────────────────────────────────────────────
+
+    @MainActor
+    func test_verifyPIN_success_resetsFailureCount() async {
+        let service = makeTestService(pin: "1234")
+
+        for _ in 1...2 { _ = await service.verifyPIN("0000") }
+        XCTAssertEqual(service.failureCount, 2)
+
+        let result = await service.verifyPIN("1234")
+
+        XCTAssertTrue(result)
+        XCTAssertEqual(service.failureCount, 0,
+            "A successful verification must clear the failure counter")
+        XCTAssertFalse(service.isLockedOut)
+    }
+
+    // ── Passcode / re-login requirement after fixed threshold ──────────────
+
+    @MainActor
+    func test_verifyPIN_belowThreshold_doesNotRequirePasscode() async {
+        let service = makeTestService()
+
+        for _ in 1...PINAuthenticationService.passcodeRequiredAfterFailures - 1 {
+            _ = await service.verifyPIN("0000")
+        }
+
+        XCTAssertFalse(service.requiresPasscodeOrRelogin,
+            "Passcode/re-login must not be required below the fixed failure threshold")
+    }
+
+    @MainActor
+    func test_verifyPIN_atThreshold_requiresPasscodeOrRelogin() async {
+        let service = makeTestService()
+
+        for _ in 1...PINAuthenticationService.passcodeRequiredAfterFailures {
+            _ = await service.verifyPIN("0000")
+        }
+
+        XCTAssertTrue(service.requiresPasscodeOrRelogin,
+            "After the fixed number of failures the device passcode or a re-login must be required")
+    }
+
+    @MainActor
+    func test_verifyPIN_requiresPasscode_rejectsEvenCorrectPIN() async {
+        let service = makeTestService(pin: "1234")
+
+        for _ in 1...PINAuthenticationService.passcodeRequiredAfterFailures {
+            _ = await service.verifyPIN("0000")
+        }
+        XCTAssertTrue(service.requiresPasscodeOrRelogin, "Precondition: passcode should be required")
+
+        let result = await service.verifyPIN("1234")
+
+        XCTAssertFalse(result,
+            "Once the passcode/re-login requirement is active, PIN verification must be rejected")
+    }
+
+    @MainActor
+    func test_verifyPIN_requiresPasscode_survivesProcessDeath() async {
+        let defaults = makeTestDefaults()
+        let service1 = makeTestService(defaults: defaults)
+
+        for _ in 1...PINAuthenticationService.passcodeRequiredAfterFailures {
+            _ = await service1.verifyPIN("0000")
+        }
+        XCTAssertTrue(service1.requiresPasscodeOrRelogin)
+
+        let service2 = makeTestService(defaults: defaults)
+
+        XCTAssertTrue(service2.requiresPasscodeOrRelogin,
+            "The passcode/re-login requirement must survive process death")
+    }
+
+    @MainActor
+    func test_completePasscodeOrRelogin_clearsLockout() async {
+        let service = makeTestService(pin: "1234")
+
+        for _ in 1...PINAuthenticationService.passcodeRequiredAfterFailures {
+            _ = await service.verifyPIN("0000")
+        }
+        XCTAssertTrue(service.requiresPasscodeOrRelogin, "Precondition: passcode should be required")
+
+        service.completePasscodeOrRelogin()
+
+        XCTAssertFalse(service.requiresPasscodeOrRelogin,
+            "Completing the passcode/re-login flow must clear the requirement")
+        XCTAssertEqual(service.failureCount, 0)
+        XCTAssertFalse(service.isLockedOut)
+
+        let result = await service.verifyPIN("1234")
+        XCTAssertTrue(result, "PIN verification must work again after passcode/re-login")
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────
+
+    private func makeTestDefaults() -> UserDefaults {
+        let suiteName = "PINAuthenticationServiceLockoutTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        addTeardownBlock { defaults.removePersistentDomain(forName: suiteName) }
+        return defaults
+    }
+
+    @MainActor
+    private func makeTestService(
+        pin: String = "1234",
+        defaults: UserDefaults? = nil,
+        now: (() -> Date)? = nil
+    ) -> PINAuthenticationService {
+        let service = PINAuthenticationService(
+            pin: pin,
+            defaults: defaults ?? makeTestDefaults(),
+            now: now ?? { Date() }
+        )
+        service.makeTimer = { _, _ in TimerToken(cancel: {}) }
+        return service
+    }
+}
+
 // MARK: - #119 OTPRateLimiter Tests
 
 final class OTPRateLimiterTests: XCTestCase {

@@ -25,6 +25,162 @@ final class KeychainServiceHostedTests: XCTestCase {
         XCTAssertEqual(KeychainService.shared.loadToken(), token)
         KeychainService.shared.deleteToken()
     }
+
+    // MARK: - #621 Constant-Time PIN Verification
+
+    func test_verifyPIN_returnsTrueForCorrectPIN() throws {
+        let pin = "482913"
+        try KeychainService.shared.savePIN(pin)
+        defer { KeychainService.shared.deletePIN() }
+
+        XCTAssertTrue(KeychainService.shared.verifyPIN(pin),
+                      "verifyPIN should accept the PIN that was stored")
+    }
+
+    func test_verifyPIN_returnsFalseForIncorrectPIN() throws {
+        let pin = "482913"
+        try KeychainService.shared.savePIN(pin)
+        defer { KeychainService.shared.deletePIN() }
+
+        XCTAssertFalse(KeychainService.shared.verifyPIN("000000"),
+                       "verifyPIN should reject a PIN that does not match")
+        XCTAssertFalse(KeychainService.shared.verifyPIN("482914"),
+                       "verifyPIN should reject a PIN differing in the last digit")
+        XCTAssertFalse(KeychainService.shared.verifyPIN(""),
+                       "verifyPIN should reject an empty PIN")
+    }
+
+    // MARK: - #622 Shared Keychain Access Group
+
+    func test_saveToken_isReadableThroughSharedAccessGroup() throws {
+        // The widget reads the token through the shared keychain-access-group
+        // declared in EthosProtocol.entitlements / TTLWidget.entitlements.
+        // Writing via the app and reading back through an explicit query that
+        // sets kSecAttrAccessGroup proves the item lands in the shared group
+        // rather than the app's default group.
+        let token = "shared-group-token-\(UUID().uuidString)"
+        KeychainService.shared.saveToken(token)
+        defer { KeychainService.shared.deleteToken() }
+
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: KeychainService.service,
+            kSecAttrAccount as String: KeychainService.tokenAccount,
+            kSecAttrAccessGroup as String: KeychainService.accessGroup,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        XCTAssertEqual(status, errSecSuccess,
+                       "Item written by the app must be readable through the shared access group (status \(status))")
+
+        let data = try XCTUnwrap(result as? Data)
+        XCTAssertEqual(String(data: data, encoding: .utf8), token)
+    }
+
+    // MARK: - #623 Update/Add Keychain Writes and Status Surfacing
+
+    func test_saveToken_returnsSuccessOnAddPath() throws {
+        KeychainService.shared.deleteToken()
+        let status = KeychainService.shared.saveToken("add-path-token")
+        defer { KeychainService.shared.deleteToken() }
+
+        XCTAssertEqual(status, errSecSuccess, "Saving a new token should succeed via SecItemAdd")
+        XCTAssertEqual(KeychainService.shared.loadToken(), "add-path-token")
+    }
+
+    func test_saveToken_returnsSuccessOnUpdatePath() throws {
+        KeychainService.shared.saveToken("initial-token")
+        defer { KeychainService.shared.deleteToken() }
+
+        let status = KeychainService.shared.saveToken("updated-token")
+
+        XCTAssertEqual(status, errSecSuccess, "Overwriting an existing token should succeed via SecItemUpdate")
+        XCTAssertEqual(KeychainService.shared.loadToken(), "updated-token",
+                       "The update path must not drop the token")
+    }
+
+    func test_saveToken_surfacesFailureStatusAndPreservesExistingToken() throws {
+        // Force a failure by making the item unreadable/unwritable is not portable,
+        // so instead assert the contract: a non-success status is returned to the
+        // caller rather than swallowed, and the previously stored token survives.
+        KeychainService.shared.saveToken("surviving-token")
+        defer { KeychainService.shared.deleteToken() }
+
+        // A save with an empty account/key is rejected by the service and must
+        // report a non-success OSStatus instead of silently dropping the token.
+        let status = KeychainService.shared.saveToken("", account: "")
+
+        XCTAssertNotEqual(status, errSecSuccess,
+                          "A failed save must surface a non-errSecSuccess OSStatus to the caller")
+        XCTAssertEqual(KeychainService.shared.loadToken(), "surviving-token",
+                       "A failed save must not delete the previously stored token")
+    }
+}
+
+// MARK: - #619 Salted PIN KDF Tests with Real Host
+
+final class KeychainServicePINKDFHostedTests: XCTestCase {
+
+    override func setUp() {
+        super.setUp()
+        KeychainService.shared.deletePINHash()
+    }
+
+    override func tearDown() {
+        KeychainService.shared.deletePINHash()
+        super.tearDown()
+    }
+
+    func test_hashPIN_verifyPIN_roundTrip() {
+        KeychainService.shared.savePINHash(for: "123456")
+        XCTAssertTrue(KeychainService.shared.verifyPIN("123456"))
+        XCTAssertFalse(KeychainService.shared.verifyPIN("654321"))
+    }
+
+    func test_hashPIN_usesDistinctSaltsForSamePIN() {
+        KeychainService.shared.savePINHash(for: "123456")
+        let first = KeychainService.shared.loadPINHashRecord()
+        KeychainService.shared.savePINHash(for: "123456")
+        let second = KeychainService.shared.loadPINHashRecord()
+
+        XCTAssertNotNil(first)
+        XCTAssertNotNil(second)
+        XCTAssertNotEqual(first?.salt, second?.salt, "Each PIN hash must use a fresh random salt")
+        XCTAssertNotEqual(first?.hash, second?.hash, "Same PIN with different salts must yield different hashes")
+    }
+
+    func test_hashPIN_isNotPlainSHA256() {
+        KeychainService.shared.savePINHash(for: "123456")
+        let record = KeychainService.shared.loadPINHashRecord()
+        XCTAssertNotNil(record)
+        // A salted KDF output must not equal the legacy unsalted SHA-256 of the PIN.
+        XCTAssertNotEqual(record?.hash, KeychainService.shared.legacyUnsaltedSHA256("123456"))
+    }
+
+    func test_verifyPIN_migratesLegacyUnsaltedHash_onSuccessfulUnlock() {
+        // Simulate an existing install with the old unsalted SHA-256 hash.
+        KeychainService.shared.saveLegacyPINHash(for: "123456")
+        XCTAssertTrue(KeychainService.shared.verifyPIN("123456"))
+
+        let migrated = KeychainService.shared.loadPINHashRecord()
+        XCTAssertNotNil(migrated)
+        XCTAssertNotNil(migrated?.salt, "Migrated hash must carry a per-PIN salt")
+        XCTAssertNotEqual(migrated?.hash, KeychainService.shared.legacyUnsaltedSHA256("123456"),
+                          "Legacy unsalted hash must be replaced by a salted KDF hash")
+        XCTAssertTrue(KeychainService.shared.verifyPIN("123456"), "Migrated hash must still verify the PIN")
+    }
+
+    func test_verifyPIN_doesNotMigrate_onFailedUnlock() {
+        KeychainService.shared.saveLegacyPINHash(for: "123456")
+        XCTAssertFalse(KeychainService.shared.verifyPIN("000000"))
+
+        let record = KeychainService.shared.loadPINHashRecord()
+        XCTAssertNil(record?.salt, "A failed unlock must not migrate the legacy hash")
+        XCTAssertEqual(record?.hash, KeychainService.shared.legacyUnsaltedSHA256("123456"))
+    }
 }
 
 // MARK: - #24 Sign-Out Push Token Unregistration Tests with Real Host

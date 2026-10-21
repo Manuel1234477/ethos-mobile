@@ -203,8 +203,162 @@ class AntiReplayHeaderTest {
     }
 
     // ---------------------------------------------------------------------------
+    // Request-signing key material (issue #607)
+    // ---------------------------------------------------------------------------
+
+    @Test
+    fun `signing key is derived from session secret and not the bearer token`() {
+        val bearerToken = "bearer-token-value"
+        val sessionSecret = "server-issued-session-secret"
+
+        val key = deriveSigningKey(sessionSecret)
+
+        // The derived key must not equal the bearer token, nor be a trivial
+        // encoding of it — the bearer token is already on the wire.
+        assertNotEquals("Signing key must not be the bearer token", bearerToken, key)
+        assertFalse(
+            "Signing key must not contain the bearer token",
+            key.contains(bearerToken)
+        )
+        assertFalse(
+            "Signing key must not be derived from the bearer token",
+            key == deriveSigningKey(bearerToken)
+        )
+
+        // Derivation must be deterministic for the same session secret.
+        assertEquals("Derivation must be deterministic", key, deriveSigningKey(sessionSecret))
+
+        // Different session secrets must yield different keys.
+        assertNotEquals(
+            "Different session secrets must yield different keys",
+            key,
+            deriveSigningKey("another-session-secret")
+        )
+    }
+
+    @Test
+    fun `canonical string includes method path body hash nonce and timestamp`() {
+        val method = "POST"
+        val path = "/vaults/v1/checkin"
+        val body = """{"vault_id":"abc"}"""
+        val nonce = generateNonce()
+        val timestamp = generateTimestamp().toString()
+
+        val canonical = buildCanonicalString(method, path, body, nonce, timestamp)
+
+        assertTrue("Canonical string must include method", canonical.contains(method))
+        assertTrue("Canonical string must include path", canonical.contains(path))
+        assertTrue(
+            "Canonical string must include body hash",
+            canonical.contains(sha256Hex(body))
+        )
+        assertTrue("Canonical string must include nonce", canonical.contains(nonce))
+        assertTrue("Canonical string must include timestamp", canonical.contains(timestamp))
+    }
+
+    @Test
+    fun `canonical string differs when method or path changes`() {
+        val body = """{"vault_id":"abc"}"""
+        val nonce = generateNonce()
+        val timestamp = generateTimestamp().toString()
+
+        val base = buildCanonicalString("POST", "/vaults/v1/checkin", body, nonce, timestamp)
+        val otherMethod = buildCanonicalString("DELETE", "/vaults/v1/checkin", body, nonce, timestamp)
+        val otherPath = buildCanonicalString("POST", "/vaults/v1/checkout", body, nonce, timestamp)
+        val otherBody = buildCanonicalString("POST", "/vaults/v1/checkin", """{"vault_id":"xyz"}""", nonce, timestamp)
+
+        assertNotEquals("Method must affect the canonical string", base, otherMethod)
+        assertNotEquals("Path must affect the canonical string", base, otherPath)
+        assertNotEquals("Body hash must affect the canonical string", base, otherBody)
+    }
+
+    @Test
+    fun `signature captured for one endpoint is rejected for another`() {
+        // Simulate a network observer capturing a signature for /vaults/v1/checkin
+        // and replaying it against /vaults/v1/checkout with the same nonce,
+        // timestamp and body.
+        val sessionSecret = "server-issued-session-secret"
+        val key = deriveSigningKey(sessionSecret)
+        val body = """{"vault_id":"abc"}"""
+        val nonce = generateNonce()
+        val timestamp = generateTimestamp().toString()
+
+        val capturedSignature = sign(
+            key,
+            buildCanonicalString("POST", "/vaults/v1/checkin", body, nonce, timestamp)
+        )
+
+        // Server-side verification for the original endpoint succeeds.
+        assertTrue(
+            "Signature must verify for the endpoint it was issued for",
+            verifySignature(
+                key,
+                buildCanonicalString("POST", "/vaults/v1/checkin", body, nonce, timestamp),
+                capturedSignature
+            )
+        )
+
+        // Replaying the same signature against a different endpoint fails,
+        // because method and path are part of the canonical string.
+        assertFalse(
+            "Signature must NOT verify for a different endpoint",
+            verifySignature(
+                key,
+                buildCanonicalString("POST", "/vaults/v1/checkout", body, nonce, timestamp),
+                capturedSignature
+            )
+        )
+
+        // Replaying against a different method also fails.
+        assertFalse(
+            "Signature must NOT verify for a different method",
+            verifySignature(
+                key,
+                buildCanonicalString("DELETE", "/vaults/v1/checkin", body, nonce, timestamp),
+                capturedSignature
+            )
+        )
+    }
+
+    // ---------------------------------------------------------------------------
     // Private helpers
     // ---------------------------------------------------------------------------
+
+    /** Mirrors the signing-key derivation in ApiClient (issue #607). */
+    private fun deriveSigningKey(sessionSecret: String): String {
+        val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+        mac.init(javax.crypto.spec.SecretKeySpec(sessionSecret.toByteArray(Charsets.UTF_8), "HmacSHA256"))
+        return mac.doFinal("ethos-request-signing-v1".toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+    }
+
+    /** Mirrors the canonical-string construction in ApiClient (issue #607). */
+    private fun buildCanonicalString(
+        method: String,
+        path: String,
+        body: String,
+        nonce: String,
+        timestamp: String
+    ): String = listOf(method.uppercase(), path, sha256Hex(body), nonce, timestamp)
+        .joinToString("\n")
+
+    private fun sha256Hex(input: String): String =
+        java.security.MessageDigest.getInstance("SHA-256")
+            .digest(input.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+
+    private fun sign(key: String, canonical: String): String {
+        val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+        mac.init(javax.crypto.spec.SecretKeySpec(key.toByteArray(Charsets.UTF_8), "HmacSHA256"))
+        return mac.doFinal(canonical.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+    }
+
+    private fun verifySignature(key: String, canonical: String, signature: String): Boolean =
+        java.security.MessageDigest.isEqual(
+            sign(key, canonical).toByteArray(Charsets.UTF_8),
+            signature.toByteArray(Charsets.UTF_8)
+        )
 
     /** Mirrors the nonce-generation logic in ApiClient.antiReplayHeaders(). */
     private fun generateNonce(): String {

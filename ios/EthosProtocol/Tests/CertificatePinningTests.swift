@@ -68,21 +68,17 @@ final class CertificatePinningTests: XCTestCase {
 
     // MARK: - SPKI extraction
 
+    func test_keyGeneration_succeedsOnSimulator() {
+        XCTAssertNotNil(generateTestKeyPair(), "Could not generate test key pair")
+    }
+
     /// Verifies that `spkiSHA256(for:)` returns a non-empty, valid Base64 string
     /// when given a real self-signed certificate. We generate one via Security
     /// framework helpers rather than embedding a DER blob.
-    func test_spkiSHA256_returnsDeterministicBase64String() throws {
-        // Create a test key pair and self-signed certificate
-        let keyParams: [String: Any] = [
-            kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
-            kSecAttrKeySizeInBits as String: 256
-        ]
-        var error: Unmanaged<CFError>?
-        guard let privateKey = SecKeyCreateRandomKey(keyParams as CFDictionary, &error),
-              let publicKey = SecKeyCopyPublicKey(privateKey),
-              let keyData = SecKeyCopyExternalRepresentation(publicKey, nil) as Data?
-        else {
-            throw XCTSkip("Could not generate test key pair")
+    func test_spkiSHA256_returnsDeterministicBase64String() {
+        guard let keyPair = generateTestKeyPair() else {
+            XCTFail("Could not generate test key pair")
+            return
         }
 
         // Build a minimal DER certificate wrapping the public key
@@ -95,14 +91,30 @@ final class CertificatePinningTests: XCTestCase {
         )
 
         // Verify the key data is non-empty (indirect proof that extraction works)
-        XCTAssertFalse(keyData.isEmpty, "Public key data should be extractable")
+        XCTAssertFalse(keyPair.publicKeyData.isEmpty, "Public key data should be extractable")
 
         // Base64-encode the raw public key (simulating what spkiSHA256 would produce)
         // and verify it's valid Base64
-        let base64 = keyData.base64EncodedString()
+        let base64 = keyPair.publicKeyData.base64EncodedString()
         XCTAssertFalse(base64.isEmpty)
         XCTAssertNotNil(Data(base64Encoded: base64),
             "Output must be valid Base64")
+    }
+
+    private func generateTestKeyPair() -> (privateKey: SecKey, publicKey: SecKey, publicKeyData: Data)? {
+        let keyParams: [String: Any] = [
+            kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+            kSecAttrKeySizeInBits as String: 256
+        ]
+        var error: Unmanaged<CFError>?
+        guard let privateKey = SecKeyCreateRandomKey(keyParams as CFDictionary, &error),
+              let publicKey = SecKeyCopyPublicKey(privateKey),
+              let publicKeyData = SecKeyCopyExternalRepresentation(publicKey, nil) as Data?
+        else {
+            return nil
+        }
+
+        return (privateKey, publicKey, publicKeyData)
     }
 
     // MARK: - Pin matching logic

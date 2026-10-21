@@ -7,8 +7,11 @@
 
 `VaultEventSocket` (Android: `services/VaultEventSocket.kt`, iOS:
 `Services/VaultEventSocket.swift`) reconnects after a dropped connection
-using `ReconnectBackoff.delayForAttempt`: exponential backoff, capped, with
-full jitter — this shipped as #253. A server restart is the scenario that
+using `ReconnectBackoff.delayForAttempt`: exponential backoff (base 1 s,
+max 30 s), capped, with full jitter — this shipped as #253. These are the
+canonical values, matching `shared/api-contract.md` §Connection lifecycle /
+§Backoff/Jitter and the defaults in `load-test/websocket-reconnect-storm.js`.
+A server restart is the scenario that
 backoff+jitter exists for: every currently-connected client is disconnected
 at the same instant, and without jitter they would all retry on the same
 clock tick, turning a routine restart into a self-inflicted thundering-herd

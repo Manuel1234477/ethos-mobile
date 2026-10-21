@@ -262,7 +262,7 @@ struct CopyableIDView: View {
     }
 
     private func copyToClipboard() {
-        UIPasteboard.general.string = fullID
+        SensitiveClipboard.copy(fullID)
         showCopiedFeedback = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             showCopiedFeedback = false
@@ -471,6 +471,7 @@ struct VaultListView: View {
     @EnvironmentObject var vaultStore: VaultStore
     @EnvironmentObject var authStore: AuthStore
     @State private var showCreate = false
+    @State private var showQRScanner = false // Issue #472
     @State private var showDeepLinkSheet = false
     @State private var showSettings = false
     @State private var showFilterMenu = false
@@ -542,6 +543,27 @@ struct VaultListView: View {
                                 .cornerRadius(6)
                             }
 
+                            // Issue #477: filter by tag, when any tag has been assigned.
+                            let knownTags = VaultTagStore.allKnownTags()
+                            if !knownTags.isEmpty {
+                                Menu {
+                                    Button("All Tags") { vaultStore.tagFilter = nil }
+                                    ForEach(knownTags, id: \.self) { tag in
+                                        Button(tag) { vaultStore.tagFilter = tag }
+                                    }
+                                } label: {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "tag")
+                                        Text(vaultStore.tagFilter ?? "All Tags")
+                                            .font(.caption2)
+                                    }
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 6)
+                                    .background(Color.blue.opacity(0.1))
+                                    .cornerRadius(6)
+                                }
+                            }
+
                             Spacer()
                         }
                         .padding(.horizontal)
@@ -588,10 +610,23 @@ struct VaultListView: View {
                     Button(action: { showCreate = true }) { Image(systemName: "plus") }
                         .accessibilityLabel("Create new vault")
                 }
+                ToolbarItem(placement: .primaryAction) {
+                    // Issue #472
+                    Button(action: { showQRScanner = true }) { Image(systemName: "qrcode.viewfinder") }
+                        .accessibilityLabel("Scan vault QR code")
+                }
                 ToolbarItem(placement: .secondaryAction) {
                     Menu {
                         NavigationLink(destination: SettingsView()) {
                             Label("Settings", systemImage: "gear")
+                        }
+                        // Issue #474
+                        NavigationLink(destination: VaultMergeView()) {
+                            Label("Duplicate Vaults", systemImage: "arrow.triangle.merge")
+                        }
+                        // Issue #475
+                        NavigationLink(destination: VaultExpiryTrendsView()) {
+                            Label("Expiry Trends", systemImage: "chart.bar")
                         }
                         Button("Sign Out") { Task { await authStore.signOut() } }
                     } label: {
@@ -601,6 +636,7 @@ struct VaultListView: View {
             }
             .task { await vaultStore.load() }
             .sheet(isPresented: $showCreate) { CreateVaultView() }
+            .sheet(isPresented: $showQRScanner) { VaultQRScannerView() } // Issue #472
             .sheet(isPresented: $showDeepLinkSheet, onDismiss: { vaultStore.pendingDeepLink = nil }) {
                 if let link = vaultStore.pendingDeepLink {
                     DeepLinkView(link: link)
@@ -708,6 +744,12 @@ struct VaultRowView: View {
     let vault: Vault
     @EnvironmentObject var vaultStore: VaultStore
     @State private var showDeleteConfirmation = false
+    // Issue #477: VaultTagStore is a plain UserDefaults-backed store, not an
+    // ObservableObject, so tags are mirrored into local @State and refreshed
+    // after every mutation to drive re-rendering.
+    @State private var tags: [String] = []
+    @State private var showAddTag = false
+    @State private var newTagText = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -727,9 +769,53 @@ struct VaultRowView: View {
                     .foregroundStyle(.orange)
                     .lineLimit(1)
                     .minimumScaleFactor(0.8)
+            } else if vault.expiryRiskLevel() == .approaching {
+                // #480: predicted-expiry planning hint, one tier below the
+                // existing server-driven "expiring soon" banner.
+                Text("Predicted check-in deadline: \(vault.predictedExpiryDate.formatted(date: .abbreviated, time: .omitted))")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            if !tags.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(tags, id: \.self) { tag in
+                            Text(tag)
+                                .font(.caption2)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .background(Color.accentColor.opacity(0.15))
+                                .clipShape(Capsule())
+                        }
+                    }
+                }
             }
         }
         .padding(.vertical, 4)
+        .onAppear { tags = VaultTagStore.tags(for: vault.id) }
+        .contextMenu {
+            Button { showAddTag = true } label: {
+                Label("Add Tag", systemImage: "tag")
+            }
+            ForEach(tags, id: \.self) { tag in
+                Button(role: .destructive) {
+                    VaultTagStore.removeTag(tag, from: vault.id)
+                    tags = VaultTagStore.tags(for: vault.id)
+                } label: {
+                    Label("Remove \"\(tag)\"", systemImage: "tag.slash")
+                }
+            }
+        }
+        .alert("Add Tag", isPresented: $showAddTag) {
+            TextField("Tag name", text: $newTagText)
+            Button("Add") {
+                VaultTagStore.addTag(newTagText, to: vault.id)
+                tags = VaultTagStore.tags(for: vault.id)
+                newTagText = ""
+            }
+            Button("Cancel", role: .cancel) { newTagText = "" }
+        }
         .swipeActions(edge: .leading, allowsFullSwipe: false) {
             Button(action: { performCheckIn() }) {
                 Label("Check In", systemImage: "checkmark.circle.fill")
@@ -844,6 +930,10 @@ struct VaultDetailView: View {
                 if let ttl = ttlRemaining {
                     LabeledContent("TTL Remaining", value: formatDuration(ttl))
                 }
+                // Issue #472
+                NavigationLink(destination: VaultQRCodeView(vault: vault)) {
+                    Label("Share via QR Code", systemImage: "qrcode")
+                }
             }
 
             Section("Two-Factor Authentication") {
@@ -918,9 +1008,17 @@ struct VaultDetailView: View {
                     Label("Expiry Notifications", systemImage: "bell.fill")
                 }
             }
+
+            // Issue #479: local action history and frequency stats.
+            Section {
+                NavigationLink(destination: VaultHistoryView(vault: vault)) {
+                    Label("Action History", systemImage: "clock.arrow.circlepath")
+                }
+            }
         }
         .navigationTitle("Vault")
         .navigationBarTitleDisplayMode(.inline)
+        .onAppear { VaultActionLog.record(.view, for: vault.id) }
         // `.task` auto-cancels when the view disappears, so this polling loop
         // (and the in-flight `getTTL` request it may be awaiting) stops cleanly
         // on navigating away instead of continuing to run in the background.
@@ -1666,7 +1764,7 @@ struct TwoFactorVerifyView: View {
                 }
                 .padding(.horizontal)
             }
-            Button(action: { UIPasteboard.general.string = backupCodes.joined(separator: "\n") }) {
+            Button(action: { SensitiveClipboard.copy(backupCodes.joined(separator: "\n")) }) {
                 Label("Copy All Codes", systemImage: "doc.on.doc").frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
