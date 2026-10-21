@@ -47,6 +47,7 @@ import socket
 import ssl
 import struct
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -116,6 +117,10 @@ def load_android_pins(source_path: str) -> set[str]:
             if pin and not _is_placeholder(pin)}
 
 # ── Certificate chain retrieval ────────────────────────────────────────────────
+
+FETCH_ATTEMPTS = 3
+FETCH_BACKOFF_SECONDS = 5
+
 
 def fetch_cert_chain(host: str, port: int) -> list[bytes]:
     """Returns raw DER-encoded certificates from the TLS handshake with host:port."""
@@ -326,18 +331,28 @@ def run(host: str, port: int, warn_days: int,
     all_pins = ios_pins | android_pins
 
     if not all_pins:
-        print("::warning::No pinned certificate hashes found in configured sources — "
+        print("::error::No pinned certificate hashes found in configured sources — "
               "cannot check expiry. Is ETHOS_CERT_PINS set or CertificatePinning.kt updated?")
-        return 0
+        return 2
 
     print(f"Checking certificate expiry for {host}:{port}")
     print(f"Pinned hashes ({len(all_pins)}): {', '.join(sorted(all_pins))}")
 
-    raw_chain = fetch_cert_chain(host, port)
+    raw_chain = []
+    for attempt in range(1, FETCH_ATTEMPTS + 1):
+        try:
+            raw_chain = fetch_cert_chain(host, port)
+        except Exception as exc:  # a raising fetch counts as a failed attempt
+            print(f"::warning::Fetch attempt {attempt} raised: {exc}")
+            raw_chain = []
+        if raw_chain:
+            break
+        if attempt < FETCH_ATTEMPTS:
+            time.sleep(FETCH_BACKOFF_SECONDS * attempt)
     if not raw_chain:
-        print(f"::warning::Could not fetch certificate chain from {host}:{port} — "
-              "check is skipped (host may be unreachable in this CI environment).")
-        return 0
+        print(f"::error::Could not fetch the certificate chain from {host}:{port} after "
+              f"{FETCH_ATTEMPTS} attempts, so expiry is unchecked. Treat as an incident.")
+        return 2
 
     today = datetime.datetime.now(datetime.timezone.utc)
     results = []

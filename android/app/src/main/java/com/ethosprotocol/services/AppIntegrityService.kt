@@ -80,6 +80,34 @@ class AppIntegrityService(
             AttestationToken.Failed(e)
         }
     }
+
+    /**
+     * #594 — Evaluates a [SignatureVerifier.SignatureResult] and decides whether
+     * the tamper warning should be shown.
+     *
+     * Only an actual [SignatureVerifier.SignatureResult.Mismatch] indicates
+     * tampering. An [SignatureVerifier.SignatureResult.Unreadable] result means
+     * the signature could not be read (e.g. a `PackageManager` failure) and must
+     * NOT be surfaced to the user as a tamper warning; the cause is logged for
+     * diagnostics instead.
+     *
+     * @return `true` if the tamper dialog should be shown, `false` otherwise.
+     */
+    fun shouldShowTamperWarning(result: SignatureVerifier.SignatureResult): Boolean {
+        return when (result) {
+            is SignatureVerifier.SignatureResult.Match -> false
+            is SignatureVerifier.SignatureResult.Mismatch -> {
+                if (BuildConfig.DEBUG) {
+                    Log.w(TAG, "Signature mismatch: expected=${result.expected}, actual=${result.actual}")
+                }
+                true
+            }
+            is SignatureVerifier.SignatureResult.Unreadable -> {
+                Log.w(TAG, "Signature unreadable; skipping tamper warning", result.cause)
+                false
+            }
+        }
+    }
 }
 
 // ── Result type ────────────────────────────────────────────────────────────────

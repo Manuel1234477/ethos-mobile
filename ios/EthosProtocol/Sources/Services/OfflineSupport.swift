@@ -111,8 +111,22 @@ final class OfflineCache {
 
     func save(_ data: Data, for key: String) {
         let file = dataFile(for: key)
-        try? data.write(to: file)
-        try? Date().timeIntervalSince1970.description.data(using: .utf8)?.write(to: metaFile(for: key))
+        do {
+            // Write the payload first; only stamp the timestamp once it has landed on disk so
+            // "data as of X" can never name a time that doesn't match the cached payload.
+            try data.write(to: file)
+        } catch {
+            // Leave the previous `.meta` untouched: the old timestamp still matches the old
+            // payload that remains on disk, rather than pairing it with a failed write.
+            LogRedactor.shared.error("OfflineCache: failed to write payload for key \(key): \(error)")
+            return
+        }
+        do {
+            let stamp = Data(Date().timeIntervalSince1970.description.utf8)
+            try stamp.write(to: metaFile(for: key))
+        } catch {
+            LogRedactor.shared.error("OfflineCache: failed to write timestamp for key \(key): \(error)")
+        }
         enforceSizeCap()
     }
 

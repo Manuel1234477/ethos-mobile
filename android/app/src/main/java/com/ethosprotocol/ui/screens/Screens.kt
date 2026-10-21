@@ -51,7 +51,9 @@ import com.ethosprotocol.ui.VaultViewModel
 import com.ethosprotocol.ui.TwoFactorViewModel
 import com.ethosprotocol.services.NotificationDeliveryLog
 import com.ethosprotocol.utils.TrackScreen
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 
 // MARK: - Accessibility Helpers
 
@@ -247,11 +249,15 @@ fun VaultListScreen(
     var pendingCheckIn by remember { mutableStateOf<Vault?>(null) }
     var biometricError by remember { mutableStateOf<String?>(null) }
 
-    // #118: Non-blocking root warning. Shown once per session; does not block access.
-    var showRootWarning by remember {
-        mutableStateOf(
+    // #118 / #485: Non-blocking root warning. The check itself (su-binary/package/mount-point
+    // scans, see IntegrityChecker) is file-I/O-bound, so it's deferred off the composition's
+    // initial state and run on Dispatchers.Default instead of blocking the first frame of this
+    // screen — the list and its data load are not gated on it.
+    var showRootWarning by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        showRootWarning = withContext(Dispatchers.Default) {
             com.ethosprotocol.services.IntegrityChecker(context).isRooted
-        )
+        }
     }
 
     LaunchedEffect(Unit) { vm.load() }

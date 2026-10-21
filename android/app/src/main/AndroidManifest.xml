@@ -30,6 +30,14 @@
             android:name="io.sentry.auto-init"
             android:value="true" />
 
+        <!-- Sentry PII controls (#640). Default PII (user identifiers, IP addresses,
+             request data) must never be attached to events. Scrubbing of query strings,
+             Authorization headers, and request bodies is applied in the beforeSend hook
+             installed by EthosProtocolApplication. -->
+        <meta-data
+            android:name="io.sentry.send-default-pii"
+            android:value="false" />
+
         <!-- EthosProtocolApplication implements Configuration.Provider to install the Hilt
              WorkerFactory (on-demand WorkManager initialization), so the default
              androidx.startup WorkManagerInitializer must be disabled, otherwise WorkManager
@@ -67,7 +75,7 @@
                 <data
                     android:scheme="https"
                     android:host="ethos-protocol.app"
-                    android:pathPrefix="/accept" />
+                    android:path="/accept" />
             </intent-filter>
 
             <!-- Deep link: ethosprotocol://vault/{vault_id}/{action} (#964) -->

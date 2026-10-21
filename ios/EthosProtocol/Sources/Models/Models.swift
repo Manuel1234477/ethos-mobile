@@ -22,6 +22,12 @@ public struct Vault: Codable, Identifiable, Equatable {
     /// The issuing account for `assetCode`, or `nil` for native XLM (mirrors
     /// `AcceptedAsset.issuer`'s convention). See api-contract.md §Vault (#222).
     public let assetIssuer: String?
+    /// Monotonic server-side version of this vault's state (#606), used to reject
+    /// out-of-order updates: a `GET /vaults/{id}` started before a `vault_updated`
+    /// push but completed after it must not overwrite the newer pushed state.
+    /// Decoded defensively: absent on a server response (older servers) defaults
+    /// to `0`, which compares as "older than any versioned update".
+    public let version: UInt64
 
     public enum VaultStatus: String, Codable {
         case active, expired, released, paused
@@ -29,7 +35,8 @@ public struct Vault: Codable, Identifiable, Equatable {
 
     public init(id: String, owner: String, beneficiary: String, balance: Int64,
                 checkInInterval: UInt64, lastCheckIn: Date, ttlRemaining: UInt64?,
-                status: VaultStatus, assetCode: String = "XLM", assetIssuer: String? = nil) {
+                status: VaultStatus, assetCode: String = "XLM", assetIssuer: String? = nil,
+                version: UInt64 = 0) {
         self.id = id
         self.owner = owner
         self.beneficiary = beneficiary
@@ -40,6 +47,7 @@ public struct Vault: Codable, Identifiable, Equatable {
         self.status = status
         self.assetCode = assetCode
         self.assetIssuer = assetIssuer
+        self.version = version
     }
 
     public init(from decoder: Decoder) throws {
@@ -54,6 +62,15 @@ public struct Vault: Codable, Identifiable, Equatable {
         status = try container.decode(VaultStatus.self, forKey: .status)
         assetCode = try container.decodeIfPresent(String.self, forKey: .assetCode) ?? "XLM"
         assetIssuer = try container.decodeIfPresent(String.self, forKey: .assetIssuer)
+        version = try container.decodeIfPresent(UInt64.self, forKey: .version) ?? 0
+    }
+
+    /// Whether `incoming` is newer than this vault's state and should replace it
+    /// (#606). An unversioned response (`version == 0`) is only accepted when the
+    /// currently applied state is also unversioned, so a stale poll can never
+    /// clobber a newer versioned push.
+    public func shouldApply(_ incoming: Vault) -> Bool {
+        incoming.version > version || (incoming.version == 0 && version == 0)
     }
 
     public var isExpiringSoon: Bool {

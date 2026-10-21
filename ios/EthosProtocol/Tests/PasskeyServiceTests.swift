@@ -167,6 +167,91 @@ final class PasskeyServiceRegistrationAtomicityTests: XCTestCase {
     }
 }
 
+// MARK: - #624 Opaque Server-Issued User Handle Tests
+
+final class PasskeyServiceUserHandleTests: XCTestCase {
+
+    override func tearDown() {
+        // PasskeyService.shared is a true singleton — restore its production seams so a
+        // leaked spy from this test doesn't affect any other test in the process.
+        PasskeyService.shared.fetchUserHandle = { try await APIClient.shared.fetchPasskeyUserHandle() }
+        PasskeyService.shared.persistUserHandle = { KeychainService.shared.saveUserHandle($0) }
+        PasskeyService.shared.loadPersistedUserHandle = { KeychainService.shared.loadUserHandle() }
+        super.tearDown()
+    }
+
+    func test_userHandle_isOpaqueServerIssued64ByteValue_notDerivedFromUsername() async throws {
+        let serverHandle = Data((0..<64).map { UInt8($0) })
+        PasskeyService.shared.fetchUserHandle = { serverHandle }
+
+        let handle = try await PasskeyService.shared.resolveUserHandle(username: "alice@example.com")
+
+        // The WebAuthn user handle must be the opaque value issued by the server (#624),
+        // never a value derived from the username.
+        XCTAssertEqual(handle, serverHandle)
+        XCTAssertEqual(handle.count, 64)
+        XCTAssertNotEqual(handle, Data("alice@example.com".utf8))
+        XCTAssertNotEqual(handle, Data("alice@example.com".utf8).sha256())
+    }
+
+    func test_resolveUserHandle_persistsServerIssuedHandle() async throws {
+        let serverHandle = Data(repeating: 0x5A, count: 64)
+        var persisted: Data?
+        PasskeyService.shared.fetchUserHandle = { serverHandle }
+        PasskeyService.shared.persistUserHandle = { persisted = $0 }
+
+        _ = try await PasskeyService.shared.resolveUserHandle(username: "bob")
+
+        XCTAssertEqual(persisted, serverHandle)
+    }
+
+    func test_resolveUserHandle_reusesPersistedHandleAcrossSessions_withoutRefetching() async throws {
+        let persistedHandle = Data(repeating: 0x7E, count: 64)
+        var fetchCalled = false
+        PasskeyService.shared.loadPersistedUserHandle = { persistedHandle }
+        PasskeyService.shared.fetchUserHandle = {
+            fetchCalled = true
+            return Data(repeating: 0x00, count: 64)
+        }
+
+        let handle = try await PasskeyService.shared.resolveUserHandle(username: "carol")
+
+        XCTAssertEqual(handle, persistedHandle)
+        XCTAssertFalse(fetchCalled, "A persisted user handle must be reused across sessions, not re-fetched")
+    }
+
+    func test_migration_keepsExistingHandleForAlreadyRegisteredPasskey() async throws {
+        // An account whose passkey was registered before #624 already has a handle
+        // stored locally; migration must not change it.
+        let existingHandle = Data(repeating: 0x42, count: 64)
+        var fetchCalled = false
+        var persisted: Data?
+        PasskeyService.shared.loadPersistedUserHandle = { existingHandle }
+        PasskeyService.shared.fetchUserHandle = {
+            fetchCalled = true
+            return Data(repeating: 0x99, count: 64)
+        }
+        PasskeyService.shared.persistUserHandle = { persisted = $0 }
+
+        let handle = try await PasskeyService.shared.resolveUserHandle(username: "dave")
+
+        XCTAssertEqual(handle, existingHandle)
+        XCTAssertFalse(fetchCalled, "Migration must not issue a new handle for an already-registered passkey")
+        XCTAssertNil(persisted, "Migration must not overwrite the existing handle")
+    }
+
+    func test_resolveUserHandle_rejectsServerHandleThatIsNot64Bytes() async {
+        PasskeyService.shared.fetchUserHandle = { Data(repeating: 0x01, count: 32) }
+
+        do {
+            _ = try await PasskeyService.shared.resolveUserHandle(username: "erin")
+            XCTFail("Expected resolveUserHandle to reject a non-64-byte server handle")
+        } catch {
+            // expected
+        }
+    }
+}
+
 // MARK: - #8 Excluded Credentials Tests
 
 @available(iOS 17.4, *)
