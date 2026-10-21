@@ -468,6 +468,7 @@ class TwoFactorViewModel @Inject constructor(
         _state.update { it.copy(switchResponse = null) }
     }
 
+    // #120: Require biometric authentication before disabling 2FA (more security-sensitive than check-in)
     fun disable2FA(vaultId: String) = viewModelScope.launch {
         _state.update { it.copy(isLoading = true, error = null) }
         when (val result = apiClient.disable2FA(vaultId)) {
@@ -477,10 +478,9 @@ class TwoFactorViewModel @Inject constructor(
         }
     }
 
-    // #120: Called only after successful BiometricHelper authentication in the screen layer.
+    // Called only after successful BiometricHelper authentication in the screen layer.
     // Keeping the biometric prompt in the screen (where a FragmentActivity is available)
-    // and the network call here (in the ViewModel) matches the same pattern used for check-in
-    // in VaultListScreen and avoids threading BiometricHelper through the ViewModel's DI graph.
+    // and the network call here (in the ViewModel) matches the same pattern used for check-in.
     fun disable2FAAfterBiometric(vaultId: String) = disable2FA(vaultId)
 
     // ── #119 internals ────────────────────────────────────────────────────────
@@ -581,6 +581,12 @@ data class VaultUiState(
 
 private const val PAGE_SIZE = 20
 
+// #486: Upper bound on how many vaults loadAll() will hold in memory at once. A user
+// with an unusually large number of vaults shouldn't balloon the app's heap just to
+// populate the list — this cap is generous enough to only trim extreme cases.
+private const val MAX_CACHED_VAULTS = 500
+private const val VAULT_VM_TAG = "VaultViewModel"
+
 @HiltViewModel
 class VaultViewModel @Inject constructor(
     private val apiClient: ApiClient,
@@ -600,6 +606,12 @@ class VaultViewModel @Inject constructor(
 
     private var nextCursor: String? = null
     private val eventJobs = mutableMapOf<String, Job>()
+
+    // #606: Highest Vault.version applied per vault id. A GET /vaults/{id} started before a
+    // `vault_updated` push but completed after it must not overwrite the newer pushed state,
+    // so every merge path (poll, push, list reload) drops any Vault whose version is not
+    // strictly greater than the one already applied.
+    private val appliedVersions = mutableMapOf<String, Long>()
 
     init {
         // #428: Observe network reachability. When connectivity is restored after an
@@ -628,16 +640,28 @@ class VaultViewModel @Inject constructor(
         when (val result = apiClient.listVaults(limit = PAGE_SIZE)) {
             is ApiResult.Success -> {
                 nextCursor = result.data.nextCursor
+                // #606: A list response can also be stale relative to a push received while
+                // it was in flight — keep the newer local copy for any vault whose applied
+                // version is ahead of the one in this response.
+                val merged = result.data.vaults.map { incoming ->
+                    val applied = appliedVersions[incoming.id]
+                    if (applied != null && incoming.version <= applied) {
+                        _state.value.vaults.firstOrNull { it.id == incoming.id } ?: incoming
+                    } else {
+                        appliedVersions[incoming.id] = incoming.version
+                        incoming
+                    }
+                }
                 _state.update {
                     it.copy(
-                        vaults = result.data.vaults,
+                        vaults = merged,
                         isLoading = false,
                         isOffline = false,
                         hasMore = result.data.hasMore
                     )
                 }
-                expiringVaultsManager.updateVaults(result.data.vaults)
-                subscribeToEvents(result.data.vaults.map { it.id })
+                expiringVaultsManager.updateVaults(merged)
+                subscribeToEvents(merged.map { it.id })
             }
             ApiResult.NetworkUnavailable -> {
                 _state.update { it.copy(isLoading = false, isOffline = true) }
@@ -693,6 +717,13 @@ class VaultViewModel @Inject constructor(
             when (val result = apiClient.listVaults(limit = limit, after = cursor)) {
                 is ApiResult.Success -> {
                     accumulated.addAll(result.data.vaults)
+                    // #486: Trim from the front once the cap is exceeded instead of letting
+                    // every subsequent page grow the list unbounded.
+                    if (accumulated.size > MAX_CACHED_VAULTS) {
+                        Log.w(VAULT_VM_TAG, "loadAll: ${accumulated.size} vaults exceeds cap " +
+                            "$MAX_CACHED_VAULTS — trimming oldest entries")
+                        while (accumulated.size > MAX_CACHED_VAULTS) accumulated.removeAt(0)
+                    }
                     cursor = result.data.nextCursor
                     if (!result.data.hasMore) {
                         _state.update { it.copy(vaults = accumulated, isLoading = false, isOffline = false) }
@@ -740,6 +771,7 @@ class VaultViewModel @Inject constructor(
     override fun onCleared() {
         eventJobs.values.forEach { it.cancel() }
         eventJobs.clear()
+        appliedVersions.clear()
     }
 
     fun checkIn(vaultId: String) = viewModelScope.launch {
@@ -772,10 +804,14 @@ class VaultViewModel @Inject constructor(
     }
 
     // Shared merge point for both a poll response (refreshSingle) and a `vault_updated`
-    // push (subscribeToEvents) — see the "Reconciling a poll/push disagreement" rule in
-    // api-contract.md (#223): whichever is received last always overwrites in place.
-    // Only updates if the vault is actually different to minimize Compose recomposition churn.
+    // push (subscribeToEvents). #606: last-applied-wins is not enough — a GET started
+    // before a push but completed after it would clobber the newer state, so an incoming
+    // Vault is only applied when its version is strictly greater than the one already
+    // applied for that vault. Equal versions are ignored to avoid needless recomposition.
     private fun updateVaultInPlace(vault: Vault) {
+        val applied = appliedVersions[vault.id]
+        if (applied != null && vault.version <= applied) return
+        appliedVersions[vault.id] = vault.version
         _state.update { state ->
             val updated = state.vaults.map { if (it.id == vault.id) vault else it }
             if (updated === state.vaults) state else state.copy(vaults = updated)
@@ -833,8 +869,10 @@ class VaultViewModel @Inject constructor(
 
     private suspend fun queueAction(action: PendingAction) {
         pendingActionDao.insert(action)
-        val queued = pendingActionDao.getAll()
-        notificationHelper.showQueuedActions(queued.size)
+        // #483: count() instead of getAll().size — avoids pulling every queued
+        // row's full columns across the binder just to show a badge count.
+        val queuedCount = pendingActionDao.count()
+        notificationHelper.showQueuedActions(queuedCount)
         PendingActionSyncWorker.schedule(context)
         _state.update { it.copy(error = "Offline — request queued and will retry automatically") }
     }

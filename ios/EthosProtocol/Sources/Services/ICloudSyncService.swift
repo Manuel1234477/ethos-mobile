@@ -10,6 +10,11 @@ final class ICloudSyncService {
     private let enabledKey = "com.ethosprotocol.icloud_sync_enabled"
     private let associationsKey = "com.ethosprotocol.vault_associations"
 
+    /// The server account ID whose associations this device is currently operating on.
+    /// Associations are keyed by "accountID/vaultID" (#618) so that a second Ethos account
+    /// signing in under the same Apple ID cannot inherit another account's mappings.
+    var currentAccountID: String?
+
     // MARK: - Association Model
 
     struct VaultAssociation: Codable, Equatable {
@@ -40,30 +45,47 @@ final class ICloudSyncService {
     /// converge on the newer association instead of one device's push silently discarding
     /// the other's.
     func save(vaultID: String, credentialID: String) {
+        guard let accountID = currentAccountID else { return }
         var assoc = loadLocalAssociations()
-        assoc[vaultID] = VaultAssociation(credentialID: credentialID, timestamp: Date().timeIntervalSince1970)
+        assoc[Self.associationKey(accountID: accountID, vaultID: vaultID)] = VaultAssociation(credentialID: credentialID, timestamp: Date().timeIntervalSince1970)
         persist(assoc)
         if isSyncEnabled { pushAssociations(assoc) }
     }
 
-    /// Return the credential ID associated with a vault, checking iCloud first when sync is on.
+    /// Return the credential ID associated with a vault, resolved through the same
+    /// last-write-wins merge used by restoreFromICloud (#617): a stale remote association
+    /// must not override a newer local one.
     func credentialID(for vaultID: String) -> String? {
-        if isSyncEnabled, let remoteAssociation = remoteAssociations()[vaultID] { return remoteAssociation.credentialID }
-        return loadLocalAssociations()[vaultID]?.credentialID
+        guard let accountID = currentAccountID else { return nil }
+        let key = Self.associationKey(accountID: accountID, vaultID: vaultID)
+        let local = loadLocalAssociations()
+        let merged = isSyncEnabled ? Self.merge(local: local, remote: remoteAssociations()) : local
+        return merged[key]?.credentialID
     }
 
-    /// Clears this device's local vault-to-credential associations (used on sign-out).
-    /// Deliberately leaves the iCloud key-value store itself untouched — wiping that would
-    /// also erase the association for any other device still signed in; restoreFromICloud()
-    /// repopulates local storage from iCloud on the next sign-in if sync is re-enabled.
+    /// Clears this device's local associations for the current account only (used on sign-out).
+    /// Other accounts' local entries are preserved, and the iCloud key-value store itself is
+    /// deliberately left untouched — wiping that would also erase the association for any
+    /// other device still signed in; restoreFromICloud() repopulates local storage from iCloud
+    /// on the next sign-in if sync is re-enabled. Keying by account ID (#618) ensures a
+    /// different account signing in under the same Apple ID cannot inherit these mappings.
     func clearLocalAssociations() {
-        UserDefaults.standard.removeObject(forKey: associationsKey)
+        guard let accountID = currentAccountID else { return }
+        let prefix = "\(accountID)/"
+        var assoc = loadLocalAssociations()
+        assoc = assoc.filter { !$0.key.hasPrefix(prefix) }
+        persist(assoc)
     }
 
     /// Pull associations from iCloud and merge into local storage using last-write-wins strategy.
     func restoreFromICloud() {
         guard isSyncEnabled else { return }
         persist(Self.merge(local: loadLocalAssociations(), remote: remoteAssociations()))
+    }
+
+    /// Association map key: scopes a vault ID to its owning server account (#618).
+    static func associationKey(accountID: String, vaultID: String) -> String {
+        "\(accountID)/\(vaultID)"
     }
 
     /// Merges two association maps using the last-write-wins conflict rule (#205): for a

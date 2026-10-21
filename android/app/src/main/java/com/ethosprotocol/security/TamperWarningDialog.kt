@@ -10,6 +10,12 @@ import androidx.compose.ui.res.stringResource
  * A non-blocking dialog shown when [SignatureVerifier] detects that the APK's
  * signing certificate does not match the expected release certificate.
  *
+ * This dialog must only be shown for [SignatureResult.Mismatch]. It is never
+ * shown for [SignatureResult.Unreadable] (e.g. a `PackageManager` failure) or
+ * [SignatureResult.NotConfigured], since those do not indicate tampering and
+ * showing the warning would falsely accuse a legitimate user. Use
+ * [shouldShowTamperWarning] to gate the dialog.
+ *
  * The dialog is *informational only* — it does not prevent the user from
  * continuing to use the app, consistent with the project's approach for
  * integrity warnings (#118: jailbreak/root detection shows a banner, not a
@@ -43,3 +49,15 @@ fun TamperWarningDialog(onDismiss: () -> Unit) {
         }
     )
 }
+
+/**
+ * Returns `true` only when the tamper warning dialog should be shown.
+ *
+ * The warning is shown exclusively for [SignatureResult.Mismatch]. An
+ * [SignatureResult.Unreadable] result (e.g. the signature could not be read
+ * from the `PackageManager`) or a [SignatureResult.NotConfigured] result must
+ * never trigger the warning, as neither indicates that the APK was tampered
+ * with.
+ */
+fun shouldShowTamperWarning(result: SignatureResult): Boolean =
+    result is SignatureResult.Mismatch

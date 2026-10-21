@@ -206,12 +206,67 @@ final class ICloudSyncServiceTests: XCTestCase {
         XCTAssertEqual(ICloudSyncService.merge(local: newer, remote: older)["vault-shared"]?.credentialID, "device-b-cred")
     }
 
-    func test_pushAssociations_doesNotClobberNewerRemoteEntryForUntouchedVault() {
+    // MARK: - #617 credentialID(for:) Honors the Merge Timestamp Rule
+
+    func test_credentialID_localNewerThanRemote_returnsLocalCredential() {
+        // A stale remote association must not override a newer local one, even with
+        // sync enabled. Exercised via the merge helper so it runs without an iCloud
+        // entitlement (NSUbiquitousKeyValueStore is unavailable in CI).
+        let local: [String: ICloudSyncService.VaultAssociation] = [
+            "vault-stale-remote": .init(credentialID: "new-local-cred", timestamp: 300)
+        ]
+        let remote: [String: ICloudSyncService.VaultAssociation] = [
+            "vault-stale-remote": .init(credentialID: "old-remote-cred", timestamp: 200)
+        ]
+        let merged = ICloudSyncService.merge(local: local, remote: remote)
+        XCTAssertEqual(merged["vault-stale-remote"]?.credentialID, "new-local-cred")
+    }
+
+    func test_credentialID_remoteNewerThanLocal_returnsRemoteCredential() {
+        // Sanity check for the opposite direction: a newer remote entry still wins.
+        let local: [String: ICloudSyncService.VaultAssociation] = [
+            "vault-newer-remote": .init(credentialID: "old-local-cred", timestamp: 100)
+        ]
+        let remote: [String: ICloudSyncService.VaultAssociation] = [
+            "vault-newer-remote": .init(credentialID: "new-remote-cred", timestamp: 400)
+        ]
+        let merged = ICloudSyncService.merge(local: local, remote: remote)
+        XCTAssertEqual(merged["vault-newer-remote"]?.credentialID, "new-remote-cred")
+    }
+
+    // MARK: - #618 Associations Are Scoped Per Server Account
+
+    func test_associations_isolatedPerAccount() {
+        ICloudSyncService.shared.save(vaultID: "vault-shared-id", credentialID: "account-a-cred", accountID: "account-a")
+        ICloudSyncService.shared.save(vaultID: "vault-shared-id", credentialID: "account-b-cred", accountID: "account-b")
+
+        XCTAssertEqual(ICloudSyncService.shared.credentialID(for: "vault-shared-id", accountID: "account-a"), "account-a-cred")
+        XCTAssertEqual(ICloudSyncService.shared.credentialID(for: "vault-shared-id", accountID: "account-b"), "account-b-cred")
+    }
+
+    func test_associations_otherAccountDoesNotInheritMapping() {
+        // A second Ethos account signing in on the same device/Apple ID must not
+        // inherit the previous account's vault-to-passkey mapping.
+        ICloudSyncService.shared.save(vaultID: "vault-inherit", credentialID: "account-a-cred", accountID: "account-a")
+        XCTAssertNil(ICloudSyncService.shared.credentialID(for: "vault-inherit", accountID: "account-b"))
+    }
+
+    func test_clearLocalAssociations_removesOnlyCurrentAccountEntries() {
+        ICloudSyncService.shared.save(vaultID: "vault-a", credentialID: "account-a-cred", accountID: "account-a")
+        ICloudSyncService.shared.save(vaultID: "vault-b", credentialID: "account-b-cred", accountID: "account-b")
+
+        ICloudSyncService.shared.clearLocalAssociations(accountID: "account-a")
+
+        XCTAssertNil(ICloudSyncService.shared.credentialID(for: "vault-a", accountID: "account-a"))
+        XCTAssertEqual(ICloudSyncService.shared.credentialID(for: "vault-b", accountID: "account-b"), "account-b-cred")
+    }
+
+    func test_pushAssociations_doesNotClobberNewerRemoteEntryForUntouchedVault() throws {
         // Simulates the double check-in race end-to-end: Device A pushes its local state
         // (which knows nothing about vault-2) after Device B already pushed a newer entry
         // for vault-2. Device A's push must not delete vault-2's association from iCloud.
-        try? XCTSkipIf(ProcessInfo.processInfo.environment["CI"] != nil,
-                      "NSUbiquitousKeyValueStore requires an iCloud entitlement + signed-in account, unavailable in CI")
+        try XCTSkipIf(ProcessInfo.processInfo.environment["CI"] != nil,
+                  "NSUbiquitousKeyValueStore requires an iCloud entitlement + signed-in account, unavailable in CI")
         let deviceBAssoc = ICloudSyncService.VaultAssociation(credentialID: "device-b-cred", timestamp: Date().timeIntervalSince1970)
         if let data = try? JSONEncoder().encode(["vault-2": deviceBAssoc]) {
             NSUbiquitousKeyValueStore.default.set(data, forKey: "com.ethosprotocol.vault_associations")

@@ -58,11 +58,11 @@ Last audited: 2026-08-31
 | **Push notifications** | | | |
 | APNs / FCM device token registration | ✅ | ✅ | |
 | TTL expiry warning notification | ✅ | ✅ | Bodies now include a truncated vault ID + TTL remaining instead of generic copy (#233); Android's server-pushed reminder includes the ID but not TTL — the FCM payload doesn't carry `ttl_remaining` today, unlike iOS's locally-scheduled reminders which already have it in hand |
-| Check-in reminder (scaled lead time) | ✅ | ❌ | Android NotificationHelper sends a generic reminder, no lead-time scaling (#TBD) |
+| Check-in reminder (scaled lead time) | ✅ | ❌ | Android NotificationHelper sends a generic reminder, no lead-time scaling (no tracking issue yet) |
 | Notification delivery analytics (scheduled/delivered/suppressed log) | ✅ | ✅ | Debug-only screen for support/QA triage (#235); iOS: `NotificationDebugView`; Android: `NotificationDebugScreen` |
 | Push token registration retry/backoff on failure | ✅ | ✅ | Previously fire-and-forget on both platforms; now retries with backoff and persists a pending token to retry on next foreground (#234) |
 | WebSocket/push duplicate notification dedup | ✅ | ✅ | A `vault_expired`/`vault_released` event applied via WebSocket suppresses a same-event push banner delivered shortly after (#232) |
-| Actionable "Check In" notification action | ✅ | ❌ | Android does not set up a CHECK_IN notification action (#TBD) |
+| Actionable "Check In" notification action | ✅ | ❌ | Android does not set up a CHECK_IN notification action (no tracking issue yet) |
 | **Offline support** | | | |
 | Network connectivity monitor | ✅ | ✅ | |
 | Offline read cache (SHA-256 keyed) | ✅ | ✅ | |
@@ -70,8 +70,8 @@ Last audited: 2026-08-31
 | Offline queue badge / notification | ✅ | ✅ | iOS: queuedCheckInCount in Stores; Android: BadgeService broadcasts queue updates | |
 | **Widget** | | | |
 | Home-screen vault TTL widget | ✅ | ✅ | iOS: WidgetKit TTLWidget; Android: VaultStatusWidget (Glance) |
-| TTL-aware refresh policy | ✅ | ❌ | Android widget polls at a fixed interval; no urgency scaling (#TBD) |
-| Widget urgency selection (which vault to surface) | ❌ | ❌ | Both platforms always show the first vault (#TBD) |
+| TTL-aware refresh policy | ✅ | ❌ | Android widget polls at a fixed interval; no urgency scaling (no tracking issue yet) |
+| Widget urgency selection (which vault to surface) | ❌ | ❌ | Both platforms always show the first vault (no tracking issue yet) |
 | **WebSocket / real-time** | | | |
 | Live vault updates via WebSocket | ✅ | ✅ | iOS: VaultEventSocket.swift; Android: VaultEventSocket.kt, both wired into their vault store/ViewModel with reconnect backoff |
 | **Background refresh** | | | |

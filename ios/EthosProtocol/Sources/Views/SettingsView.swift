@@ -4,9 +4,55 @@ struct SettingsView: View {
     @State private var iCloudSyncEnabled = ICloudSyncService.shared.isSyncEnabled
     @State private var reLockTimeout = ReLockTimeoutOption.current
     @State private var hapticFeedbackEnabled = HapticFeedbackService.isEnabled
+    // Issue #476
+    @ObservedObject private var accountManager = AccountManager.shared
+    @State private var showSaveAccountAlert = false
+    @State private var newAccountLabel = ""
 
     var body: some View {
         Form {
+            Section {
+                ForEach(accountManager.accounts) { account in
+                    Button {
+                        accountManager.switchTo(account.id)
+                    } label: {
+                        HStack {
+                            Label(account.label, systemImage: "person.crop.circle")
+                            Spacer()
+                            if account.id == accountManager.activeAccountId {
+                                Image(systemName: "checkmark").foregroundStyle(.blue)
+                            }
+                        }
+                    }
+                    .foregroundStyle(.primary)
+                }
+                .onDelete { offsets in
+                    for index in offsets {
+                        accountManager.removeAccount(accountManager.accounts[index].id)
+                    }
+                }
+                Button(action: { showSaveAccountAlert = true }) {
+                    Label("Save Current Account", systemImage: "plus.circle")
+                }
+            } header: {
+                Text("Accounts")
+            } footer: {
+                // #476: see AccountManager's doc comment — switching swaps the
+                // active auth session only, not per-account app data yet.
+                Text("Save the account you're signed in with to switch back to it later without re-authenticating. Switching accounts does not yet separate vault tags, history, or notification settings between accounts.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .alert("Save Current Account", isPresented: $showSaveAccountAlert) {
+                TextField("Label (e.g. Personal)", text: $newAccountLabel)
+                Button("Save") {
+                    guard !newAccountLabel.isEmpty else { return }
+                    accountManager.saveCurrentSessionAsAccount(label: newAccountLabel)
+                    newAccountLabel = ""
+                }
+                Button("Cancel", role: .cancel) { newAccountLabel = "" }
+            }
+
             Section {
                 Toggle("Sync vault associations to iCloud", isOn: $iCloudSyncEnabled)
                     .onChange(of: iCloudSyncEnabled) { _, newValue in

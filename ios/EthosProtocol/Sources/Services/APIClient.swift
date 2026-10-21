@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import QuartzCore
 
@@ -158,7 +159,7 @@ public final class APIClient {
 
     /// "Sign out this device" for a specific session (may be the caller's own current session).
     func revokeSession(id: String) async throws {
-        var req = request(path: "/auth/sessions/\(id)")
+        var req = request(path: Self.path("/auth/sessions", id))
         req.httpMethod = "DELETE"
         for (field, value) in Self.makeAntiReplayHeaders() {
             req.setValue(value, forHTTPHeaderField: field)
@@ -188,8 +189,15 @@ public final class APIClient {
     static let defaultVaultPageSize = 50
     private static let nextCursorHeader = "X-Next-Cursor"
 
+    /// The inclusive range shared/api-contract.md §Pagination defines for `limit`.
+    static let vaultPageSizeRange = 1...100
+
     /// Fetches a single page of the caller's vaults, starting after `cursor`
     /// (`nil` requests the first page). Drives VaultListView's "Load More".
+    ///
+    /// `limit` is clamped to the contract's 1...100 range (#599) so a caller
+    /// passing 0, a negative, or an oversized value never sends a request the
+    /// server must reject or silently reinterpret.
     func listVaults(cursor: String? = nil, limit: Int = APIClient.defaultVaultPageSize) async throws -> VaultPage {
         var req = request(path: "/vaults", queryItems: Self.vaultsQueryItems(cursor: cursor, limit: limit))
         req.httpMethod = "GET"
@@ -201,9 +209,10 @@ public final class APIClient {
 
     /// Builds the `GET /vaults` query items for `cursor`/`limit` — split out from
     /// listVaults() so the cursor/limit contract is unit-testable independent of
-    /// the network layer.
+    /// the network layer. `limit` is clamped to `vaultPageSizeRange` (#599).
     static func vaultsQueryItems(cursor: String?, limit: Int) -> [URLQueryItem] {
-        var queryItems = [URLQueryItem(name: "limit", value: String(limit))]
+        let clampedLimit = min(max(limit, vaultPageSizeRange.lowerBound), vaultPageSizeRange.upperBound)
+        var queryItems = [URLQueryItem(name: "limit", value: String(clampedLimit))]
         if let cursor, !cursor.isEmpty {
             queryItems.append(URLQueryItem(name: "cursor", value: cursor))
         }
@@ -215,13 +224,34 @@ public final class APIClient {
         (value?.isEmpty ?? true) ? nil : value
     }
 
+    /// Upper bound on the number of pages listAllVaults() will fetch before giving
+    /// up. Guards against a server that never stops returning a next cursor (or a
+    /// pathologically large account) growing `all` without limit.
+    static let maxVaultPages = 100
+
     /// Fetches every page and concatenates the results, for callers (background
     /// refresh, the TTL widget) that need the complete vault set to compute
     /// accurate TTL warnings rather than a single page at a time.
+    ///
+    /// Guards against non-advancing cursors and unbounded pagination (#604): if the
+    /// server repeats a cursor we've already followed, or we exceed `maxVaultPages`,
+    /// we throw instead of looping forever. The error surfaces through
+    /// `errorDescription`/`recoverySuggestion` so the UI can present it.
     public func listAllVaults() async throws -> [Vault] {
         var all: [Vault] = []
         var cursor: String?
+        var seenCursors = Set<String>()
+        var pageCount = 0
         repeat {
+            if let cursor {
+                guard seenCursors.insert(cursor).inserted else {
+                    throw APIError.serverError("Pagination did not advance; please try again")
+                }
+            }
+            guard pageCount < Self.maxVaultPages else {
+                throw APIError.serverError("Too many vaults to load at once; please try again")
+            }
+            pageCount += 1
             let page = try await listVaults(cursor: cursor)
             all.append(contentsOf: page.vaults)
             cursor = page.nextCursor
@@ -237,7 +267,7 @@ public final class APIClient {
     }
 
     func getVault(id: String) async throws -> Vault {
-        try await get(path: "/vaults/\(id)")
+        try await get(path: Self.path("/vaults", id))
     }
 
     func createVault(beneficiary: String, checkInInterval: UInt64, idempotencyKey: String? = nil) async throws -> Vault {
@@ -246,57 +276,57 @@ public final class APIClient {
     }
 
     func checkIn(vaultID: String, idempotencyKey: String? = nil) async throws {
-        let _: EmptyBody = try await post(path: "/vaults/\(vaultID)/checkin", body: EmptyBody(), idempotencyKey: idempotencyKey)
+        let _: EmptyBody = try await post(path: Self.path("/vaults", vaultID, "checkin"), body: EmptyBody(), idempotencyKey: idempotencyKey)
     }
 
     func deposit(vaultID: String, amount: Int64) async throws -> Vault {
-        try await post(path: "/vaults/\(vaultID)/deposit", body: ["amount": amount])
+        try await post(path: Self.path("/vaults", vaultID, "deposit"), body: ["amount": amount])
     }
 
     func withdraw(vaultID: String, amount: Int64) async throws -> Vault {
-        try await post(path: "/vaults/\(vaultID)/withdraw", body: ["amount": amount])
+        try await post(path: Self.path("/vaults", vaultID, "withdraw"), body: ["amount": amount])
     }
 
     func updateBeneficiary(vaultID: String, newBeneficiary: String) async throws -> Vault {
-        try await post(path: "/vaults/\(vaultID)/beneficiary", body: ["beneficiary": newBeneficiary])
+        try await post(path: Self.path("/vaults", vaultID, "beneficiary"), body: ["beneficiary": newBeneficiary])
     }
 
     func acceptBeneficiary(vaultID: String, token: String) async throws {
         let body = ["vault_id": vaultID, "token": token]
-        let _: EmptyBody = try await post(path: "/vaults/\(vaultID)/accept", body: body)
+        let _: EmptyBody = try await post(path: Self.path("/vaults", vaultID, "accept"), body: body)
     }
 
     func getTTL(vaultID: String) async throws -> UInt64 {
-        let result: [String: UInt64] = try await get(path: "/vaults/\(vaultID)/ttl")
+        let result: [String: UInt64] = try await get(path: Self.path("/vaults", vaultID, "ttl"))
         return result["ttl_remaining"] ?? 0
     }
 
     // MARK: - 2FA
 
     func get2FAStatus(vaultID: String) async throws -> TwoFactorStatus {
-        try await get(path: "/vaults/\(vaultID)/2fa/status")
+        try await get(path: Self.path("/vaults", vaultID, "2fa", "status"))
     }
 
     func enable2FA(vaultID: String, method: TwoFactorMethod, phone: String? = nil, email: String? = nil) async throws -> Enable2FAResponse {
         let body = Enable2FARequest(method: method, phone: phone, email: email)
-        return try await post(path: "/vaults/\(vaultID)/2fa/enable", body: body)
+        return try await post(path: Self.path("/vaults", vaultID, "2fa", "enable"), body: body)
     }
 
     /// #226: `trustDevice` opt-in — when true the server returns a device trust token.
     func verify2FA(vaultID: String, otp: String, trustDevice: Bool = false) async throws -> Verify2FAResponse {
-        try await post(path: "/vaults/\(vaultID)/2fa/verify", body: Verify2FARequest(otp: otp, trustDevice: trustDevice))
+        try await post(path: Self.path("/vaults", vaultID, "2fa", "verify"), body: Verify2FARequest(otp: otp, trustDevice: trustDevice))
     }
 
     func disable2FA(vaultID: String) async throws {
-        let _: EmptyBody = try await post(path: "/vaults/\(vaultID)/2fa/disable", body: EmptyBody())
+        let _: EmptyBody = try await post(path: Self.path("/vaults", vaultID, "2fa", "disable"), body: EmptyBody())
     }
 
     func challenge2FA(vaultID: String) async throws -> TwoFactorStatus {
-        try await post(path: "/vaults/\(vaultID)/2fa/challenge", body: EmptyBody())
+        try await post(path: Self.path("/vaults", vaultID, "2fa", "challenge"), body: EmptyBody())
     }
 
     func clear2FASession(vaultID: String) async throws {
-        let _: EmptyBody = try await post(path: "/vaults/\(vaultID)/2fa/session/clear", body: EmptyBody())
+        let _: EmptyBody = try await post(path: Self.path("/vaults", vaultID, "2fa", "session", "clear"), body: EmptyBody())
     }
 
     // MARK: - #226 Trust Device
@@ -305,7 +335,7 @@ public final class APIClient {
     /// when the user opted in to "remember this device". The returned token is persisted
     /// in the Keychain and sent as X-Device-Trust-Token on subsequent sensitive requests.
     func trustDevice(vaultID: String) async throws -> TrustDeviceResponse {
-        try await post(path: "/vaults/\(vaultID)/2fa/trust-device", body: TrustDeviceRequest(trustDevice: true))
+        try await post(path: Self.path("/vaults", vaultID, "2fa", "trust-device"), body: TrustDeviceRequest(trustDevice: true))
     }
 
     // MARK: - #224 Backup Codes
@@ -313,12 +343,12 @@ public final class APIClient {
     /// Generates a new set of 8 one-time backup codes (invalidates any previous set).
     /// Codes are shown exactly once — the server stores only hashes thereafter.
     func generateBackupCodes(vaultID: String) async throws -> BackupCodesResponse {
-        try await post(path: "/vaults/\(vaultID)/2fa/backup-codes/generate", body: EmptyBody())
+        try await post(path: Self.path("/vaults", vaultID, "2fa", "backup-codes", "generate"), body: EmptyBody())
     }
 
     /// Returns whether backup codes exist and how many remain (never the code values themselves).
     func getBackupCodesStatus(vaultID: String) async throws -> BackupCodesStatus {
-        try await get(path: "/vaults/\(vaultID)/2fa/backup-codes/status")
+        try await get(path: Self.path("/vaults", vaultID, "2fa", "backup-codes", "status"))
     }
 
     // MARK: - #225 Switch 2FA Method
@@ -328,7 +358,7 @@ public final class APIClient {
     /// confirms the new one — the account is never left without 2FA protection.
     func switch2FAMethod(vaultID: String, newMethod: TwoFactorMethod, phone: String? = nil, email: String? = nil) async throws -> Enable2FAResponse {
         let body = Switch2FARequest(newMethod: newMethod, phone: phone, email: email)
-        return try await post(path: "/vaults/\(vaultID)/2fa/switch", body: body)
+        return try await post(path: Self.path("/vaults", vaultID, "2fa", "switch"), body: body)
     }
 
     // MARK: - Push Notifications
@@ -387,6 +417,33 @@ public final class APIClient {
 
     // MARK: - Private helpers
 
+    /// Builds a request path from a fixed prefix plus one or more dynamic
+    /// segments (vault/session IDs), percent-encoding each dynamic segment so
+    /// an ID containing `?`, `#`, `/`, or `%2F` can never escape its slot and
+    /// address a different resource (#598, iOS counterpart of issue 44).
+    ///
+    /// The first argument is treated as a literal path prefix (e.g. "/vaults");
+    /// every subsequent argument is encoded as a single path segment.
+    static func path(_ prefix: String, _ segments: String...) -> String {
+        var result = prefix
+        for segment in segments {
+            result += "/" + percentEncodePathSegment(segment)
+        }
+        return result
+    }
+
+    /// Percent-encodes `segment` so it is safe as exactly one path segment.
+    /// `.urlPathAllowed` permits "/" (and, on some platforms, other separators),
+    /// so those are removed before encoding — otherwise an ID like "a/b" would
+    /// still be interpreted as two segments.
+    static func percentEncodePathSegment(_ segment: String) -> String {
+        var allowed = CharacterSet.urlPathAllowed
+        allowed.remove(charactersIn: "/?#%")
+        // Fall back to the raw segment only if encoding somehow fails; the
+        // characters removed above make that practically impossible.
+        return segment.addingPercentEncoding(withAllowedCharacters: allowed) ?? segment
+    }
+
     private func get<T: Decodable>(path: String) async throws -> T {
         var req = request(path: path)
         req.httpMethod = "GET"
@@ -413,13 +470,18 @@ public final class APIClient {
     }
 
     private func request(path: String, queryItems: [URLQueryItem]? = nil) -> URLRequest {
-        let url = baseURL.appendingPathComponent(path)
-        var finalURL = url
-        if let queryItems, !queryItems.isEmpty,
-           var components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
-            components.queryItems = queryItems
-            finalURL = components.url ?? url
+        // Build the URL with URLComponents rather than appendingPathComponent so
+        // the already-percent-encoded path (see path(_:_:) above) is preserved
+        // verbatim instead of being re-encoded or normalized (#598).
+        var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
+        let basePath = components?.percentEncodedPath ?? baseURL.path
+        let trimmedBase = basePath.hasSuffix("/") ? String(basePath.dropLast()) : basePath
+        let normalizedPath = path.hasPrefix("/") ? path : "/" + path
+        components?.percentEncodedPath = trimmedBase + normalizedPath
+        if let queryItems, !queryItems.isEmpty {
+            components?.queryItems = queryItems
         }
+        let finalURL = components?.url ?? baseURL.appendingPathComponent(path)
         var req = URLRequest(url: finalURL)
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if let token = KeychainService.shared.loadToken() {
@@ -432,20 +494,57 @@ public final class APIClient {
     // Applied to every mutating request (POST / DELETE). GET requests are
     // idempotent and do not require replay protection.
     //
-    // X-Nonce : 32 cryptographically-random bytes from CryptoKit, hex-encoded.
-    //           The server stores seen nonces and rejects any duplicate within
-    //           the token's validity window.
+    // X-Nonce : 32 cryptographically-random bytes from CryptoKit's
+    //           SymmetricKey(size: .bits256), hex-encoded. The server stores
+    //           seen nonces and rejects any duplicate within the token's
+    //           validity window.
     // X-Timestamp : current Unix epoch in seconds. The server rejects requests
     //               where |server_time − timestamp| > 300 s (5-minute window).
     static func makeAntiReplayHeaders() -> [String: String] {
-        // CryptoKit guarantees OS-CSPRNG quality randomness (SecRandomCopyBytes underneath).
-        let nonceBytes = (0..<32).map { _ in UInt8.random(in: 0...255) }
+        // CryptoKit's SymmetricKey draws from the OS CSPRNG (SecRandomCopyBytes
+        // underneath), matching shared/api-contract.md's nonce contract.
+        let nonceBytes = SymmetricKey(size: .bits256).withUnsafeBytes { Array($0) }
         let nonce = nonceBytes.map { String(format: "%02x", $0) }.joined()
         let timestamp = String(Int(Date().timeIntervalSince1970))
         return ["X-Nonce": nonce, "X-Timestamp": timestamp]
     }
 
     private func execute(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        // #609: Documented replay_detected recovery (docs/api-error-codes.md). A 400/403
+        // whose body is {"error":"replay_detected"} means the server rejected our
+        // X-Nonce/X-Timestamp (e.g. clock drift). For mutating requests we regenerate
+        // both headers and retry exactly once; GETs are never retried here.
+        let (data, http) = try await perform(request)
+        guard Self.isReplayDetected(statusCode: http.statusCode, data: data),
+              Self.isMutating(method: request.httpMethod) else {
+            return (data, http)
+        }
+        var retryRequest = request
+        for (field, value) in Self.makeAntiReplayHeaders() {
+            retryRequest.setValue(value, forHTTPHeaderField: field)
+        }
+        let (retryData, retryHTTP) = try await perform(retryRequest)
+        if Self.isReplayDetected(statusCode: retryHTTP.statusCode, data: retryData) {
+            // Retry also rejected — surface the normal server error rather than looping.
+            let msg = (try? JSONDecoder().decode([String: String].self, from: retryData))?["error"] ?? "Server error"
+            throw APIError.serverError(msg)
+        }
+        return (retryData, retryHTTP)
+    }
+
+    /// Whether `data` is the documented `{"error":"replay_detected"}` body for a 400/403.
+    static func isReplayDetected(statusCode: Int, data: Data) -> Bool {
+        guard statusCode == 400 || statusCode == 403 else { return false }
+        return (try? JSONDecoder().decode([String: String].self, from: data))?["error"] == "replay_detected"
+    }
+
+    /// POST/DELETE are the mutating verbs this client issues and the only ones that
+    /// carry anti-replay headers, so they're the only ones eligible for replay recovery.
+    static func isMutating(method: String?) -> Bool {
+        method == "POST" || method == "DELETE"
+    }
+
+    private func perform(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         // Falling back to a cached response for a mutating request (POST/DELETE — e.g.
         // check-in, withdraw, disable2FA) would make the app report success for an action
         // that never actually reached the server, which is unacceptable for this app.
@@ -551,6 +650,9 @@ public final class APIClient {
     // GET is the only idempotent verb this client issues — retrying POST/DELETE
     // automatically could double-submit a mutation (check-in, withdrawal, 2FA
     // disable, ...), so only GET requests are eligible for `withRetry`.
+    // (The one exception is the #609 replay_detected recovery in execute(_:), which
+    // retries a mutation once with fresh anti-replay headers — the server rejected
+    // the request before processing it, so no double-submit is possible.)
     static func isRetryable(method: String?) -> Bool { method == "GET" }
 
     private static func isTransientNetworkError(_ error: Error) -> Bool {

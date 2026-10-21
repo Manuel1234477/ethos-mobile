@@ -67,7 +67,43 @@ final class PendingCheckInStoreTests: XCTestCase {
             "The queue must be durable across process restarts, not just in-memory")
     }
 
+    // ── File protection (#613) ──────────────────────────────────────────────
+
+    func test_insert_writesFileWithExplicitFileProtection() throws {
+        let fileURL = makeTestFileURL()
+        addTeardownBlock { try? FileManager.default.removeItem(at: fileURL) }
+        let store = PendingCheckInStore(fileURL: fileURL)
+
+        store.insert(PendingCheckIn(vaultId: "vault-1", queuedAt: Date()))
+
+        let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+        let protection = attributes[.protectionKey] as? FileProtectionType
+        XCTAssertTrue(
+            protection == .complete || protection == .completeUnlessOpen,
+            "Queued check-in file must be written with explicit file protection " +
+            "(.completeFileProtection or .completeFileProtectionUnlessOpen), got \(String(describing: protection))"
+        )
+    }
+
+    // ── Write failure propagation (#615) ────────────────────────────────────
+
+    func test_insert_propagatesWriteError_insteadOfSwallowingIt() {
+        // Point the store at a path whose parent directory does not exist, so the
+        // atomic write cannot succeed. A `try?` here would silently drop the
+        // queued check-in; the error must surface to the caller instead.
+        let unwritableURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PendingCheckInStoreTests-missing-\(UUID().uuidString)")
+            .appendingPathComponent("queue.json")
+        let store = PendingCheckInStore(fileURL: unwritableURL)
+
+        XCTAssertThrowsError(
+            try store.insertThrowing(PendingCheckIn(vaultId: "vault-1", queuedAt: Date())),
+            "A failed queue write must propagate the error so the UI can surface it"
+        )
+    }
+
     // ── Sole insertion point (#203 regression guard) ────────────────────────
+=======
 
     func test_shared_isASingleton() {
         XCTAssertTrue(PendingCheckInStore.shared === PendingCheckInStore.shared,

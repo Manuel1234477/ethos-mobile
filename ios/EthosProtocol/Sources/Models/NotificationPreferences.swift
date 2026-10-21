@@ -51,4 +51,26 @@ struct NotificationPreferences: Codable, Equatable {
             return hour >= quietHoursStart || hour < quietHoursEnd
         }
     }
+
+    /// Issue #478: the next moment a notification scheduled "now" should actually
+    /// be delivered, respecting quiet hours. Returns `date` unchanged when quiet
+    /// hours don't apply right now; otherwise returns the next occurrence of
+    /// `quietHoursEnd` today or tomorrow.
+    ///
+    /// `isSuppressedByQuietHours` on its own was dead code — nothing called it,
+    /// so near-immediate local notifications (TTL warnings, queued check-in
+    /// alerts, vault-expired alerts) fired regardless of quiet hours. This is
+    /// what those scheduling call sites should use instead of a fixed delay.
+    func nextAllowedDeliveryDate(from date: Date = Date(), calendar: Calendar = .current) -> Date {
+        guard isSuppressedByQuietHours(at: date, calendar: calendar) else { return date }
+        var components = calendar.dateComponents([.year, .month, .day], from: date)
+        components.hour = quietHoursEnd
+        components.minute = 0
+        components.second = 0
+        guard let todayEnd = calendar.date(from: components) else { return date }
+        // Quiet hours wrap midnight (e.g. 22:00-08:00) and `date` is past
+        // midnight but still inside the window (e.g. 02:00) — today's "end"
+        // time has already passed, so the real end is today's end + 24h.
+        return todayEnd > date ? todayEnd : calendar.date(byAdding: .day, value: 1, to: todayEnd) ?? todayEnd
+    }
 }

@@ -56,6 +56,73 @@ class LogRedactorTest {
     }
 
     // -------------------------------------------------------------------------
+    // redactString — token-bearing query parameters
+    // -------------------------------------------------------------------------
+
+    /**
+     * Each sensitive query parameter value must be replaced with `[REDACTED]`
+     * so tokens embedded in URLs never reach the logs.
+     */
+    @Test
+    fun testQueryParameterTokenRedacted() {
+        assertQueryParamRedacted("token", "/accept?token=abc123")
+    }
+
+    @Test
+    fun testQueryParameterCodeRedacted() {
+        assertQueryParamRedacted("code", "/callback?code=abc123")
+    }
+
+    @Test
+    fun testQueryParameterOtpRedacted() {
+        assertQueryParamRedacted("otp", "/verify?otp=abc123")
+    }
+
+    @Test
+    fun testQueryParameterSecretRedacted() {
+        assertQueryParamRedacted("secret", "/reset?secret=abc123")
+    }
+
+    @Test
+    fun testQueryParameterKeyRedacted() {
+        assertQueryParamRedacted("key", "/unlock?key=abc123")
+    }
+
+    /**
+     * A URL carrying several sensitive parameters at once must have every
+     * sensitive value redacted while non-sensitive parameters are preserved.
+     */
+    @Test
+    fun testMultipleSensitiveQueryParametersRedacted() {
+        val input = "/accept?token=abc123&code=def456&otp=ghi789&secret=jkl012&key=mno345&state=xyz"
+        val output = LogRedactor.redactString(input)
+
+        for (value in listOf("abc123", "def456", "ghi789", "jkl012", "mno345")) {
+            assertFalse(
+                "Sensitive query value '$value' must not appear in redacted output",
+                output.contains(value)
+            )
+        }
+        assertTrue(
+            "Non-sensitive 'state' parameter must be preserved",
+            output.contains("state=xyz")
+        )
+    }
+
+    private fun assertQueryParamRedacted(name: String, input: String) {
+        val output = LogRedactor.redactString(input)
+
+        assertFalse(
+            "Sensitive query value for '$name' must not appear in redacted output",
+            output.contains("abc123")
+        )
+        assertTrue(
+            "Output should contain '$name=[REDACTED]'",
+            output.contains("$name=[REDACTED]")
+        )
+    }
+
+    // -------------------------------------------------------------------------
     // redactHeaders — sensitive headers
     // -------------------------------------------------------------------------
 

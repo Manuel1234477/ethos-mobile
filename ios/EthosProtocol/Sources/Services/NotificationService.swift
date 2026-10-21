@@ -17,6 +17,15 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
     }
     var retryPolicy: RetryPolicy = .networkDefault
 
+    /// Issue #478: delay (seconds, >= `minimum`) before a near-immediate local
+    /// notification should actually fire, pushed out past quiet hours if the
+    /// user is currently in them.
+    private func deferredDelay(minimum: TimeInterval) -> TimeInterval {
+        let now = Date()
+        let allowed = NotificationPreferences.current.nextAllowedDeliveryDate(from: now)
+        return max(minimum, allowed.timeIntervalSince(now))
+    }
+
     func requestPermission() async {
         let granted = (try? await UNUserNotificationCenter.current()
             .requestAuthorization(options: [.alert, .badge, .sound])) ?? false
@@ -156,7 +165,7 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
         content.title = LocalizedStrings.queuedCheckInTitle
         content.body = LocalizedStrings.queuedCheckInBody(count: count)
 
-        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false)
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: deferredDelay(minimum: 1), repeats: false)
         let request = UNNotificationRequest(identifier: Self.queuedCheckInIdentifier, content: content, trigger: trigger)
         center.removePendingNotificationRequests(withIdentifiers: [Self.queuedCheckInIdentifier])
         center.add(request)
@@ -177,7 +186,7 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
         content.body = LocalizedStrings.vaultExpiredBody
         content.sound = .default
         content.userInfo = ["vault_id": vaultId]
-        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false)
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: deferredDelay(minimum: 1), repeats: false)
         let request = UNNotificationRequest(identifier: identifier, content: content, trigger: trigger)
         center.add(request)
     }
@@ -224,7 +233,18 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                  didReceive response: UNNotificationResponse,
                                  withCompletionHandler completionHandler: @escaping () -> Void) {
-        let vaultID = response.notification.request.content.userInfo["vault_id"] as? String
+        let content = response.notification.request.content
+        let vaultID = content.userInfo["vault_id"] as? String
+        // Issue #473: the same eventType derivation willPresent uses, so tap/
+        // dismiss events group under the same key as scheduled/delivered ones.
+        let eventType = (content.userInfo["type"] as? String) ?? content.categoryIdentifier
+        let source: NotificationDeliveryEvent.Source = content.userInfo["type"] != nil ? .push : .local
+
+        if response.actionIdentifier == UNNotificationDismissActionIdentifier {
+            NotificationDeliveryLog.shared.record(kind: .dismissed, source: source, eventType: eventType, vaultID: vaultID ?? "unknown")
+        } else {
+            NotificationDeliveryLog.shared.record(kind: .tapped, source: source, eventType: eventType, vaultID: vaultID ?? "unknown")
+        }
 
         switch response.actionIdentifier {
         case "CHECK_IN_ACTION":
@@ -233,7 +253,17 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
             // throwing/Void signature and the CheckInSyncTask.APIClientProtocol conformance's
             // overload — pin the reference to the original before calling it.
             let performCheckIn: (String, String?) async throws -> Void = APIClient.shared.checkIn(vaultID:idempotencyKey:)
-            Task { try? await performCheckIn(id, nil) }
+            Task {
+                do {
+                    try await performCheckIn(id, nil)
+                    // Issue #473: recorded only on success, separately from the
+                    // tap above, so tap rate and completion rate are distinguishable.
+                    NotificationDeliveryLog.shared.record(kind: .completed, source: source, eventType: eventType, vaultID: id)
+                } catch {
+                    // Swallowed deliberately (pre-existing behavior): a failed
+                    // tap-to-check-in has no UI to surface an error to here.
+                }
+            }
 
         case "SNOOZE_7_DAYS":
             rescheduleNotificationReminder(forVaultID: vaultID, delaySeconds: 7 * 24 * 3_600)
@@ -275,22 +305,65 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
         NotificationDeliveryLog.shared.record(kind: .scheduled, source: .local, eventType: "snooze_reminder", vaultID: vaultID)
     }
 
+    private static let ttlWarningBatchIdentifier = "ttl-warning-batch"
+    private static let ttlWarningBatchDefaultsKey = "com.ethosprotocol.pending_ttl_warning_batch"
+
     // Fires immediately to warn the user their vault TTL is under 24 hours (called from background refresh).
+    //
+    // #478: outside quiet hours this behaves as before — one immediate per-vault
+    // notification. During quiet hours, instead of firing (and silently queuing)
+    // a separate notification per vault as each one's TTL crosses the warning
+    // threshold, vault IDs accumulate into one pending batch that's delivered as
+    // a single combined notification when quiet hours end.
     func scheduleTTLWarning(vaultID: String, ttlRemaining: UInt64) {
         let center = UNUserNotificationCenter.current()
         center.removePendingNotificationRequests(withIdentifiers: ["ttl-warning-\(vaultID)"])
 
+        guard NotificationPreferences.current.isSuppressedByQuietHours() else {
+            let content = UNMutableNotificationContent()
+            content.title = LocalizedStrings.ttlWarningTitle
+            content.body = LocalizedStrings.ttlWarningBody(vaultID: truncatedVaultID(vaultID), timeRemaining: formatTTLRemaining(Int(ttlRemaining)))
+            content.sound = .default
+            content.userInfo = ["vault_id": vaultID]
+            content.categoryIdentifier = "CHECK_IN"
+
+            let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 5, repeats: false)
+            let request = UNNotificationRequest(identifier: "ttl-warning-\(vaultID)", content: content, trigger: trigger)
+            center.add(request)
+            NotificationDeliveryLog.shared.record(kind: .scheduled, source: .local, eventType: "ttl_warning", vaultID: vaultID)
+            return
+        }
+
+        var pending = Set(UserDefaults.standard.stringArray(forKey: Self.ttlWarningBatchDefaultsKey) ?? [])
+        pending.insert(vaultID)
+        UserDefaults.standard.set(Array(pending), forKey: Self.ttlWarningBatchDefaultsKey)
+
         let content = UNMutableNotificationContent()
         content.title = LocalizedStrings.ttlWarningTitle
-        content.body = LocalizedStrings.ttlWarningBody(vaultID: truncatedVaultID(vaultID), timeRemaining: formatTTLRemaining(Int(ttlRemaining)))
+        content.body = pending.count == 1
+            ? LocalizedStrings.ttlWarningBody(vaultID: truncatedVaultID(vaultID), timeRemaining: formatTTLRemaining(Int(ttlRemaining)))
+            : "\(pending.count) vaults have TTL warnings waiting."
         content.sound = .default
-        content.userInfo = ["vault_id": vaultID]
         content.categoryIdentifier = "CHECK_IN"
 
-        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 5, repeats: false)
-        let request = UNNotificationRequest(identifier: "ttl-warning-\(vaultID)", content: content, trigger: trigger)
-        center.add(request)
-        NotificationDeliveryLog.shared.record(kind: .scheduled, source: .local, eventType: "ttl_warning", vaultID: vaultID)
+        center.removePendingNotificationRequests(withIdentifiers: [Self.ttlWarningBatchIdentifier])
+        let delay = deferredDelay(minimum: 5)
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: delay, repeats: false)
+        let request = UNNotificationRequest(identifier: Self.ttlWarningBatchIdentifier, content: content, trigger: trigger)
+        center.add(request) { [weak self] error in
+            guard error == nil else { return }
+            // Clear the pending set once the batch has actually been scheduled for
+            // delivery, so the next call starts a fresh batch instead of growing
+            // this one forever.
+            self?.clearPendingTTLWarningBatchAfter(delay: delay)
+        }
+        NotificationDeliveryLog.shared.record(kind: .scheduled, source: .local, eventType: "ttl_warning_batched", vaultID: vaultID)
+    }
+
+    private func clearPendingTTLWarningBatchAfter(delay: TimeInterval) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            UserDefaults.standard.removeObject(forKey: Self.ttlWarningBatchDefaultsKey)
+        }
     }
 
     func registerNotificationCategories() {
@@ -299,8 +372,12 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
         // (resetting the vault's TTL) straight from the lock screen banner, bypassing the
         // BiometricService confirmation that guards the equivalent in-app action.
         let checkInAction = UNNotificationAction(identifier: "CHECK_IN_ACTION", title: LocalizedStrings.checkInAction, options: [.foreground, .authenticationRequired])
+        // Issue #473: .customDismissAction is required for a plain swipe-to-dismiss
+        // to actually invoke didReceive(response:) at all — without it, iOS doesn't
+        // report dismissals to the delegate, so dismissal tracking would silently
+        // never fire no matter what the delegate method itself did.
         let category = UNNotificationCategory(identifier: "CHECK_IN", actions: [checkInAction],
-                                               intentIdentifiers: [], options: [])
+                                               intentIdentifiers: [], options: [.customDismissAction])
         UNUserNotificationCenter.current().setNotificationCategories([category])
     }
 }

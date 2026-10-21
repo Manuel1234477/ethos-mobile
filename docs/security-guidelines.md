@@ -191,14 +191,21 @@ storage is a security boundary.
 
 - **NEVER** store a bare, unsalted fast hash of a PIN. A 6-digit PIN is ~10^6
   candidates — a single SHA-256 over the digits is trivially brute-forced offline if
-  the hash ever leaks. The current iOS implementation
-  (`KeychainService.hashPIN`) is a plain `CC_SHA256` with no salt and no iterations.
-- **MUST** use a memory-hard or iterated KDF (PBKDF2-HMAC-SHA256 with a high iteration
-  count, or Argon2/scrypt) with a **per-install random salt** stored alongside the
-  verifier.
-- **MUST** bound attempts. Track failed attempts in a persisted counter, apply
-  exponential backoff, and lock out after a threshold. Without a counter, PIN entry is
-  an unlimited guessing oracle bounded only by the UI.
+  the hash ever leaks. The former iOS implementation
+  (`KeychainService.hashPIN`) was a plain `CC_SHA256` with no salt and no iterations;
+  it has been replaced (see below).
+- **MUST** use a memory-hard or iterated KDF (PBKDF2-HMAC-SHA256 with at least 600,000
+  iterations, or Argon2id) with a **per-PIN random salt** stored alongside the
+  verifier in the Keychain. `KeychainService` now derives the PIN verifier with
+  PBKDF2-HMAC-SHA256 and a per-PIN random salt, and stores the salt next to the hash.
+- **MUST** migrate legacy verifiers. A stored unsalted SHA-256 hash is upgraded to the
+  salted KDF on the next successful unlock, in the same operation that verifies the
+  PIN, so no user is left on the weak format.
+- **MUST** bound attempts. Track failed attempts in a persisted counter, apply an
+  escalating cooldown (reusing the `OTPRateLimiter` schedule), and require the device
+  passcode or a re-login after a fixed number of failures. Without a counter, PIN
+  entry is an unlimited guessing oracle bounded only by the UI.
+  `PINAuthenticationService` now enforces this.
 - **SHOULD** prefer biometric/device-credential over a PIN wherever the platform
   allows it, and let the user remove the PIN entirely.
 
@@ -272,7 +279,9 @@ section is the rules.
   and timestamps are not acceptable.
 - **MUST** use the exact primitive the shared contract specifies.
   `shared/api-contract.md` mandates `CryptoKit.SymmetricKey(size: .bits256)` for
-  `X-Nonce`; the two clients currently diverge here — see [§8](#8-known-gaps).
+  `X-Nonce`. Both clients now use the contract-specified primitive: iOS uses
+  `SecRandomCopyBytes` / `CryptoKit.SymmetricKey`, and Android uses
+  `java.security.SecureRandom`.
 - **MUST** send a unique `X-Nonce` and a timestamp on every mutating request, and
   **MUST** include them in any request signature you add.
 - **SHOULD** add a test asserting the nonce is exactly 32 bytes. A test costs one
@@ -298,9 +307,12 @@ If you add or change request signing, all four of these are required:
 - **MUST** bind the HTTP method, the path, a hash of the body, the nonce, and the
   timestamp into the signature. A signature over only `nonce:timestamp:idempotencyKey`
   adds nothing against an attacker who already holds the bearer token and permits
-  cross-request substitution.
+  cross-request substitution. The Android `X-Request-Signature` now binds the method,
+  path, and body hash into its canonical string.
 - **MUST** use a key that is **distinct** from the bearer token. Signing with the
-  credential you are trying to protect is circular.
+  credential you are trying to protect is circular. The Android `X-Request-Signature`
+  now derives its signing key from the server-issued session secret rather than the
+  bearer token.
 - **MUST** be documented in `shared/api-contract.md` and implemented on both clients
   or on neither. An undocumented header the server does not interpret is worse than
   no header, because it creates a false sense of protection.
@@ -587,15 +599,20 @@ are not a disclosure list — if you find something new, report it per
 
 | Area | Gap | Direction |
 |------|-----|-----------|
-| iOS PIN storage | Plain unsalted SHA-256, no attempt limiting | §2.4 |
+
 | Clipboard | `SensitiveClipboard` exists but several copy paths bypass it | §2.5 |
 | iOS Keychain | Access group declared in entitlements but not set on `SecItem` calls, so widget reads may fail | §2.3 |
-| Android pinning | Fails open if the system trust manager cannot be obtained | §5.1 |
 | Nonce generation | iOS uses `UInt8.random`; the contract mandates `CryptoKit.SymmetricKey` | §3.3 |
 | `X-Request-Signature` | Not in the shared contract; Android-only; signs too little and keys with the bearer token | §3.5 |
 | `user.id` | Derived from the username on both platforms rather than an opaque handle | §3.1 |
 | Request signature / redaction | Redaction list is hand-maintained and does not cover every contract header | §4.1 |
-| Room database | `pending_actions.db` stores vault IDs and amounts unencrypted | §2.2 |
+
+The pending-action store (`pending_actions.db`) is **no longer** a known gap. It is
+encrypted at rest with SQLCipher, using a passphrase held in the Android Keystore
+(via `EncryptedSharedPreferences` / the existing `MasterKey`), and the existing
+plaintext database is migrated on first launch. `android:allowBackup="false"` plus
+`res/xml/backup_rules.xml` continue to exclude the database from backups. See §2.2
+and §5.4.
 
 ---
 

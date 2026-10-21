@@ -1,6 +1,6 @@
 {
   "description": "Shared Stellar address validation test fixtures (SEP-0023 StrKey format)",
-  "tracking": "#113, #264 (unifies cross-platform test validation)",
+  "tracking": "#113, #264 (unifies cross-platform test validation), #637 (LogRedactor redaction)",
   "valid": {
     "publicKeys": [
       {
@@ -92,5 +92,32 @@
       "type": "invalid",
       "reason": "Invalid format"
     }
-  ]
+  ],
+  "redaction": {
+    "description": "Fixtures for LogRedactor Stellar address redaction (#637). Each entry is a log line containing a Stellar address that must be redacted.",
+    "gAddresses": [
+      {
+        "input": "beneficiary=GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        "address": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+      },
+      {
+        "input": "owner=GAAACAQDAQCQMBYIBEFAWDANBYHRAEISCMKBKFQXDAMRUGY4DUPB7JZX",
+        "address": "GAAACAQDAQCQMBYIBEFAWDANBYHRAEISCMKBKFQXDAMRUGY4DUPB7JZX"
+      },
+      {
+        "input": "failed request for GD6WNKTD7WDTPTGTOVFLBKLPIHMYZPBKBWUQHVL3OQQZZIJDX4GKCY5",
+        "address": "GD6WNKTD7WDTPTGTOVFLBKLPIHMYZPBKBWUQHVL3OQQZZIJDX4GKCY5"
+      }
+    ],
+    "mAddresses": [
+      {
+        "input": "beneficiary=MA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUAAAAAAAAAAAACJUQ",
+        "address": "MA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUAAAAAAAAAAAACJUQ"
+      },
+      {
+        "input": "owner=MA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVAAAAAAAAAAAAAJLK",
+        "address": "MA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVAAAAAAAAAAAAAJLK"
+      }
+    ]
+  }
 }

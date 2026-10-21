@@ -24,8 +24,9 @@ replayed by a network attacker must be rejected by the server.
 - GET requests **do not** need these headers (they are read-only and idempotent).
 - The nonce must be generated fresh for **every** request — reusing a nonce from a previous
   request will cause the server to reject it even if the timestamp is within window.
-- Clients use `CryptoKit.SymmetricKey(size: .bits256)` (iOS) / `SecureRandom` (Android) to
-  generate the nonce bytes — `Math.random()` or `UUID` is not acceptable.
+- Clients use `SecRandomCopyBytes` (or `CryptoKit.SymmetricKey(size: .bits256)`) on iOS and
+  `SecureRandom` on Android to generate the nonce bytes — `Math.random()`, `UUID`, or
+  `UInt8.random(in:)` are not acceptable.
 
 ### Example mutating request headers
 ```
@@ -193,7 +194,8 @@ deposit, withdrawal, beneficiary change, status transition).
 The server routes subsequent `vault_updated`/`vault_expired`/`vault_released` events for all listed vault IDs over this connection. Clients connecting to a single vault via the URL query parameter need not send `subscribe`. The server acknowledges with a `subscribed` message.
 
 #### Connection lifecycle
-- Reconnect with exponential backoff (base 1 s, max 60 s) on any non-4401 close.
+- Reconnect with exponential backoff (base 1 s, max 30 s) on any non-4401 close — see
+  §Backoff/Jitter Formula (#254) for the exact formula both clients implement.
 - On `vault_updated`, merge the embedded `vault` object into the local vault list in-place
   (do not full-reload from REST).
 - On `vault_expired` / `vault_released`, trigger a local notification if the app is backgrounded.
@@ -249,26 +251,30 @@ actions and must be gated behind a biometric (or device passcode) prompt client-
 the request is sent — the same `BiometricService`/`BiometricHelper` used for withdrawals and
 2FA disable.
 
-#### Reconciling a poll/push disagreement (#223)
+#### Reconciling a poll/push disagreement (#223, #606)
 
-The `Vault` object carries no per-field update timestamp, so a client cannot tell
-whether a `vault_updated` push or a concurrent `GET /vaults/{id}` poll response
-reflects newer server state — both are reads of the same server-side row, taken
-at slightly different moments. The rule both clients implement is **last-applied-wins**:
-whichever of the two (poll response or push) is *received* last simply overwrites
-the in-memory vault in place, with no comparison against what was there before.
+Every `Vault` carries a monotonically increasing server-assigned `version` (see
+§Models → Vault). A client can therefore tell whether a `vault_updated` push or a
+concurrent `GET /vaults/{id}` poll response reflects newer server state, even when
+the two arrive out of order. The rule both clients implement is
+**highest-version-wins**: an update (from either source) is applied only if its
+`version` is strictly greater than the `version` already applied for that vault;
+otherwise it is discarded.
 
-This falls directly out of §WebSocket's framing of the stream as "a latency
-optimization, not the source of truth": a push is not treated as more or less
-authoritative than a poll, it is just another delivery of the same kind of data,
-applied whenever it arrives. Concretely:
+This closes the out-of-order race where a `GET /vaults/{id}` started before a
+`vault_updated` push, but completed after it, would otherwise overwrite the newer
+pushed state with older data. Concretely:
 - A poll response and a push are merged through the exact same code path
-  (iOS: `VaultStore.applyUpdate`; Android: `VaultViewModel.updateVaultInPlace`).
-- Neither implementation buffers, timestamps, or compares values before merging —
-  the most recently *received* update is always what's displayed.
+  (iOS: `VaultStore.applyUpdate`; Android: `VaultViewModel.updateVaultInPlace`),
+  which compares `version` before writing.
+- An update whose `version` is less than or equal to the last applied `version`
+  for that vault is ignored — it never overwrites in-memory state.
+- A vault not yet present locally is always accepted (nothing to compare against).
 - This applies to every field on `Vault`, including `ttl_remaining` — see
-  `TTLCountdown`/`TtlCountdown`'s reconciliation logic (#221), which is likewise
-  indifferent to whether the fresh value came from a poll or a push.
+  `TTLCountdown`/`TtlCountdown`'s reconciliation logic (#221), which likewise
+  only accepts a fresh value whose `version` is newer.
+- If a server response omits `version` (older server), clients fall back to
+  last-applied-wins for backward compatibility.
 
 ---
 
@@ -299,6 +305,36 @@ Response: `204 No Content` on success; `401` if token is invalid/expired; `404` 
   forwards the token. The token is extracted from the `/vaults/{id}/accept` HTTPS deep-link URL
   in `MainActivity.extractBeneficiaryAccept()` and threaded through navigation to
   `AcceptanceViewModel.accept(vaultId, token)`.
+
+---
+
+## Request Signing (`X-Request-Signature`, #607)
+
+Android attaches an `X-Request-Signature` header to mutating requests. The MAC is
+computed over a canonical string that binds the signature to the specific request,
+so a captured signature cannot be replayed against another endpoint:
+
+```
+canonical = METHOD + "\n"
+          + PATH + "\n"
+          + hex(SHA256(body)) + "\n"
+          + X-Nonce + "\n"
+          + X-Timestamp
+signature = hex(HMAC-SHA256(signing_key, canonical))
+```
+
+- `METHOD` is the uppercase HTTP method (e.g. `POST`).
+- `PATH` is the request path **without** the query string (e.g. `/vaults/{id}/checkin`).
+- `body` is the exact request body bytes; for bodyless requests use the SHA-256 of the
+  empty string.
+- `X-Nonce` / `X-Timestamp` are the same values sent in the anti-replay headers (see
+  §Anti-Replay Protection), so a signature is only valid within the same replay window.
+
+**Signing key (#607):** the HMAC key is **not** the bearer token. It is a separate
+server-issued session signing secret, delivered alongside the `AuthToken` and never sent
+on the wire. The bearer token is already transmitted on every request, so keying the MAC
+with it would add no secret a network observer lacks. If no signing secret is available,
+the client omits the header entirely rather than falling back to the bearer token.
 
 ---
 
@@ -388,9 +424,15 @@ GET /vaults?limit={n}&after={cursor}
   "ttl_remaining": 0,
   "status": "active|expired|released|paused",
   "asset_code": "XLM",
-  "asset_issuer": "string | null"
+  "asset_issuer": "string | null",
+  "version": 0
 }
 ```
+`version` (#606) is a server-assigned, monotonically increasing integer bumped on
+every mutation of the vault row. Clients use it to discard stale poll/push
+responses — see §Reconciling a poll/push disagreement (#223, #606). It is optional
+in responses for backward compatibility; when absent, clients fall back to
+last-applied-wins.
 `asset_code`/`asset_issuer` (#222) identify which Stellar asset `balance` is
 denominated in, the same way `ACCEPTED_ASSETS` entries do elsewhere in this API:
 `asset_code` alone (native XLM) or `asset_code` + `asset_issuer` (any other

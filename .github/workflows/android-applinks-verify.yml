@@ -4,14 +4,21 @@ on:
   push:
     branches: [main]
     paths:
-      # Re-run if the manifest or the verification script itself changes.
+      # Re-run if the manifest, the verification script, the hosted
+      # assetlinks.json, or the shared cert pins change.
       - "android/app/src/main/AndroidManifest.xml"
       - "scripts/verify_assetlinks.sh"
+      - ".well-known/assetlinks.json"
+      - "shared/cert-pins.json"
+      - "android/app/src/main/java/**/SignatureVerifier.kt"
   pull_request:
     branches: [main]
     paths:
       - "android/app/src/main/AndroidManifest.xml"
       - "scripts/verify_assetlinks.sh"
+      - ".well-known/assetlinks.json"
+      - "shared/cert-pins.json"
+      - "android/app/src/main/java/**/SignatureVerifier.kt"
   # Daily scheduled run catches any server-side drift in assetlinks.json
   # without needing a code push.
   schedule:
@@ -28,7 +35,19 @@ jobs:
     permissions:
       issues: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+
+      - name: Verify signing fingerprint consistency (Play / assetlinks / verifier)
+        env:
+          # Service-account JSON key with Play Developer API access to the app.
+          # Leave unset to skip the Play API comparison (the local
+          # assetlinks.json <-> shared/cert-pins.json check still runs).
+          PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          PLAY_PACKAGE_NAME: com.ethosprotocol
+          ASSETLINKS_FILE: .well-known/assetlinks.json
+          CERT_PINS_FILE: shared/cert-pins.json
+          SIGNATURE_VERIFIER_FILE: android/app/src/main/java/com/ethosprotocol/security/SignatureVerifier.kt
+        run: bash scripts/verify_signing_fingerprint.sh
 
       - name: Verify assetlinks.json
         env:
@@ -51,7 +70,7 @@ jobs:
       # new one when none exists.
       - name: Alert on failure (scheduled run)
         if: failure() && github.event_name == 'schedule'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const title = "⚠️ assetlinks.json verification failed (scheduled check)";
@@ -84,8 +103,10 @@ jobs:
                 "- Package name `com.ethosprotocol` no longer listed",
                 "- `delegate_permission/common.handle_all_urls` relation removed",
                 "- Certificate fingerprint rotated without updating assetlinks.json",
+                "- Play App Signing certificate no longer matches assetlinks.json /",
+                "  SignatureVerifier.EXPECTED_CERT_SHA256 (shared/cert-pins.json)",
                 "",
-                "Related: #94, #63"
+                "Related: #94, #63, #595"
               ].join("\n"),
               labels: ["bug", "android", "ci"]
             });
