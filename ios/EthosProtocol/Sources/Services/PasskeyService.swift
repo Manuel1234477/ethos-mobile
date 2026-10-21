@@ -11,10 +11,19 @@ final class PasskeyService: NSObject {
     // Injectable seams for testing (mirrors BackgroundRefreshService.vaultListProvider):
     // ASAuthorizationController itself can't be driven from a unit test, but everything
     // downstream of a successful ceremony can be exercised via these.
-    var registerWithBackend: (String, String, String) async throws -> AuthToken = { credentialID, publicKey, clientDataJSON in
+    // #624: The backend now issues an opaque, random 64-byte WebAuthn user handle at
+    // registration. It is returned alongside the AuthToken so it can be persisted and
+    // reused as `user.id` for every subsequent ceremony — never derived from the username.
+    var registerWithBackend: (String, String, String) async throws -> PasskeyRegistrationResult = { credentialID, publicKey, clientDataJSON in
         try await APIClient.shared.registerPasskey(credentialID: credentialID, publicKey: publicKey, clientDataJSON: clientDataJSON)
     }
     var persistCredentialID: (String) -> Void = { KeychainService.shared.saveCredentialID($0) }
+    // #624: Persists the server-issued opaque user handle (base64url of 64 random bytes).
+    // Injectable so tests can verify it is stored verbatim and never re-derived.
+    var persistUserHandle: (String) -> Void = { KeychainService.shared.saveUserHandle($0) }
+    // #624: Reads back a previously persisted handle for an already-registered passkey.
+    // During migration an existing credential keeps its original handle unchanged.
+    var loadUserHandle: () -> String? = { KeychainService.shared.loadUserHandle() }
 
     // Keyed by ObjectIdentifier(controller) so two concurrent performRequest() calls each
     // retain their own delegate without clobbering each other — a single stored property
@@ -57,9 +66,15 @@ final class PasskeyService: NSObject {
     // synchronous continuation, never after control returns to the caller — is
     // unit-testable without driving a real ASAuthorizationController ceremony.
     func completeRegistration(credentialID: String, publicKey: String, clientDataJSON: String) async throws -> AuthToken {
-        let token = try await registerWithBackend(credentialID, publicKey, clientDataJSON)
+        let result = try await registerWithBackend(credentialID, publicKey, clientDataJSON)
         persistCredentialID(credentialID)
-        return token
+        // #624: Persist the server-issued opaque handle so future ceremonies reuse it.
+        // If the backend didn't return one (older server), leave any existing handle
+        // untouched rather than falling back to a username-derived value.
+        if let handle = result.userHandle, !handle.isEmpty {
+            persistUserHandle(handle)
+        }
+        return result.token
     }
 
     func authenticate() async throws -> AuthToken {
@@ -142,7 +157,7 @@ final class PasskeyService: NSObject {
         let request = provider.createCredentialRegistrationRequest(
             challenge: challengeData,
             name: username,
-            userID: Data(username.utf8)
+            userID: try Self.webauthnUserID(username: username, loadUserHandle: loadUserHandle)
         )
         // Without this, a user (or anyone with physical access) can register a second,
         // independent passkey for an account that already has one on this device — the
@@ -191,6 +206,37 @@ final class PasskeyService: NSObject {
             clientDataJSON: reg.rawClientDataJSON.base64URLEncodedString(),
             attestationFormat: attestationFormat
         )
+    }
+
+    /// #624: Resolves the opaque WebAuthn `user.id` for a registration ceremony.
+    ///
+    /// - If a handle was already persisted (an existing passkey on this device), it is
+    ///   returned unchanged so the credential's user handle stays stable across
+    ///   re-registration/migration — the WebAuthn spec requires an opaque, stable value.
+    /// - Otherwise a fresh random 64-byte handle is generated locally and used for this
+    ///   ceremony; the backend issues the canonical handle at registration and
+    ///   `completeRegistration` persists it, replacing this provisional value.
+    ///
+    /// The handle is always opaque bytes (base64url-encoded) and is never derived from
+    /// the username. `username` is accepted only to document that it is deliberately
+    /// unused for the user handle.
+    static func webauthnUserID(username: String, loadUserHandle: () -> String?) throws -> Data {
+        if let existing = loadUserHandle(), let data = Data(base64URLEncoded: existing), !data.isEmpty {
+            return data
+        }
+        return generateOpaqueUserHandle()
+    }
+
+    /// Generates a random 64-byte opaque WebAuthn user handle.
+    static func generateOpaqueUserHandle() -> Data {
+        var bytes = [UInt8](repeating: 0, count: 64)
+        let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        if status != errSecSuccess {
+            // SecRandomCopyBytes only fails if the RNG is unavailable; fall back to
+            // SystemRandomNumberGenerator so registration can still proceed.
+            return Data((0..<64).map { _ in UInt8.random(in: .min ... .max) })
+        }
+        return Data(bytes)
     }
 
     @available(iOS 17.4, *)
@@ -247,6 +293,13 @@ class PasskeyDelegate: NSObject, ASAuthorizationControllerDelegate {
         continuation.resume(throwing: error)
         onComplete()
     }
+}
+
+/// #624: Result of a backend registration call — the session token plus the
+/// server-issued opaque WebAuthn user handle (base64url of 64 random bytes).
+struct PasskeyRegistrationResult {
+    let token: AuthToken
+    let userHandle: String?
 }
 
 enum PasskeyError: LocalizedError, Equatable {

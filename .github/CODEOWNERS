@@ -1,0 +1,11 @@
+# Security-sensitive paths need review from the security owners before merge.
+# Replace @ethos-protocol/security-owners with a team that exists in the organisation.
+
+**/CertificatePinning.*          @ethos-protocol/security-owners
+**/KeychainService.*             @ethos-protocol/security-owners
+**/DeepLinkParser.*              @ethos-protocol/security-owners
+**/*Deeplink*                    @ethos-protocol/security-owners
+.github/workflows/*release*.yml  @ethos-protocol/security-owners
+.github/workflows/*deploy*.yml   @ethos-protocol/security-owners
+.github/scripts/check_cert*      @ethos-protocol/security-owners
+scripts/check_sensitive_files.py @ethos-protocol/security-owners

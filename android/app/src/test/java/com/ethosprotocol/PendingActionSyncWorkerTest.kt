@@ -157,6 +157,70 @@ class PendingActionSyncWorkerTest {
     }
 
     @Test
+    fun `check-in row with null vaultId is dead-lettered without calling the api`() = runTest {
+        val bad = PendingAction(
+            id = 1,
+            type = PendingActionType.CHECK_IN,
+            vaultId = null,
+            queuedAt = 1L
+        )
+        coEvery { dao.getAll() } returnsMany listOf(listOf(bad), emptyList())
+        coEvery { dao.markDeadLetter(any(), any()) } just Runs
+        coEvery { dao.delete(any()) } just Runs
+
+        val result = worker.doWork()
+
+        assertEquals(ListenableWorker.Result.success(), result)
+        coVerify(exactly = 0) { apiClient.checkIn(any(), any()) }
+        coVerify { dao.markDeadLetter(bad.id, any()) }
+        coVerify(exactly = 0) { dao.markSynced(any()) }
+    }
+
+    @Test
+    fun `create-vault row with null payloadJson is dead-lettered without calling the api`() = runTest {
+        val bad = PendingAction(
+            id = 2,
+            type = PendingActionType.CREATE_VAULT,
+            payloadJson = null,
+            queuedAt = 2L
+        )
+        coEvery { dao.getAll() } returnsMany listOf(listOf(bad), emptyList())
+        coEvery { dao.markDeadLetter(any(), any()) } just Runs
+        coEvery { dao.delete(any()) } just Runs
+
+        val result = worker.doWork()
+
+        assertEquals(ListenableWorker.Result.success(), result)
+        coVerify(exactly = 0) { apiClient.createVault(any(), any()) }
+        coVerify { dao.markDeadLetter(bad.id, any()) }
+        coVerify(exactly = 0) { dao.markSynced(any()) }
+    }
+
+    @Test
+    fun `malformed row does not block a subsequent valid row in the same run`() = runTest {
+        val bad = PendingAction(
+            id = 1,
+            type = PendingActionType.CHECK_IN,
+            vaultId = null,
+            queuedAt = 1L
+        )
+        val good = checkInAction("v1").copy(id = 2)
+        coEvery { dao.getAll() } returnsMany listOf(listOf(bad, good), emptyList())
+        coEvery { dao.markDeadLetter(any(), any()) } just Runs
+        coEvery { apiClient.checkIn("v1", good.idempotencyKey) } returns ApiResult.Success(Unit)
+        coEvery { dao.markSynced(good.id) } just Runs
+        coEvery { dao.delete(any()) } just Runs
+
+        val result = worker.doWork()
+
+        assertEquals(ListenableWorker.Result.success(), result)
+        coVerify { dao.markDeadLetter(bad.id, any()) }
+        coVerify { apiClient.checkIn("v1", good.idempotencyKey) }
+        coVerify { dao.markSynced(good.id) }
+        coVerify { dao.delete(good) }
+    }
+
+    @Test
     fun `mixed check-in and create-vault items are both dispatched and removed on success`() = runTest {
         val checkIn = checkInAction("v1")
         val vaultReq = CreateVaultRequest("GXYZ", 2_592_000L)

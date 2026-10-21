@@ -43,10 +43,20 @@ settings:
     # for each target. Find it at https://developer.apple.com/account/#/membership.
     # Deliberately left blank — do NOT fill this in with a placeholder/fake ID.
     DEVELOPMENT_TEAM: ""
-    # #170: certificate pins for api.ethos-protocol.app. Both Info.plists expand these
-    # into their TLS_PUBLIC_KEY_PINS array, so a pin rotation is a build-setting change
-    # rather than a plist edit, and can differ per build configuration. Supply the real
-    # values on the build invocation (or in Xcode's build settings / an .xcconfig):
+    # #170/#593: certificate pins for api.ethos-protocol.app. Both Info.plists expand
+    # these into their TLS_PUBLIC_KEY_PINS array, so a pin rotation is a build-setting
+    # change rather than a plist edit, and can differ per build configuration.
+    #
+    # The pin set is single-sourced in shared/cert-pins.json. Do NOT hand-edit the
+    # values below: .github/scripts/generate_cert_pins.py reads that JSON and rewrites
+    # these two lines (and the Android buildConfigField in android/app/build.gradle.kts)
+    # so both platforms stay in sync. Rotate a pin by editing shared/cert-pins.json and
+    # re-running the generator, then commit the regenerated files.
+    #
+    #   python3 .github/scripts/generate_cert_pins.py
+    #
+    # The generated values can still be overridden on the build invocation (or in
+    # Xcode's build settings / an .xcconfig) if needed:
     #
     #   xcodebuild -configuration Release \
     #     TLS_PUBLIC_KEY_PIN_CURRENT=<base64 SPKI SHA-256> \
@@ -54,7 +64,8 @@ settings:
     #
     # Left blank here on purpose: PinningDelegate ignores empty entries, so an
     # unconfigured build has pinning disabled (the documented local-dev behavior).
-    # Release builds are gated by .github/scripts/check_tls_pinning.py.
+    # Release builds are gated by .github/scripts/check_tls_pinning.py, which also
+    # asserts the generated iOS and Android pin sets match.
     TLS_PUBLIC_KEY_PIN_CURRENT: ""
     TLS_PUBLIC_KEY_PIN_BACKUP: ""
 

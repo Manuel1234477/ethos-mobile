@@ -1,5 +1,7 @@
 # Mobile Passkey Flow for iOS and Android
 
+> **Superseded:** Use the [Passkey Authentication Guide](passkey-authentication-guide.md) for current implementation details, API shapes, security guidance, and troubleshooting. Examples below are historical and may not match the current clients.
+
 ## Overview
 
 This document describes how WebAuthn/Passkey credentials are created, registered, and used across iOS and Android platforms in Ethos-Protocol. It covers the complete flow from credential creation to authentication.

@@ -28,7 +28,7 @@ jobs:
     permissions:
       issues: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Verify apple-app-site-association
         env:
@@ -44,7 +44,7 @@ jobs:
       # new one when none exists.
       - name: Alert on failure (scheduled run)
         if: failure() && github.event_name == 'schedule'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const title = "⚠️ apple-app-site-association verification failed (scheduled check)";

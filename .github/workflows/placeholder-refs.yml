@@ -1,0 +1,26 @@
+name: Placeholder References
+
+# Fails when a placeholder issue token (#TBD, #XXX) is committed. Placeholders
+# look like real links and stay in place unless something flags them.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  placeholder-refs:
+    name: Reject placeholder issue references
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fail on #TBD or #XXX
+        run: |
+          if git grep -nE '#(TBD|XXX)' -- ':!.github/workflows/placeholder-refs.yml'; then
+            echo "::error::Replace the placeholder with a real issue number, or remove it."
+            exit 1
+          fi

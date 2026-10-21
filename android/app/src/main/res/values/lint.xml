@@ -4,4 +4,10 @@
          This complements the externalizing of existing hardcoded strings in Issue #312
          by preventing new hardcoded strings from being added in the future. -->
     <issue id="HardcodedText" severity="error" />
+
+    <!-- Flag unguarded vaultId references inside Log.* calls (Issue #631).
+         Vault IDs may only be logged in debug builds (gated on BuildConfig.DEBUG)
+         or as a hash. This custom detector is provided by the :lint-checks module
+         registered via lintChecks in build.gradle.kts. -->
+    <issue id="UnguardedVaultIdLog" severity="error" />
 </lint>

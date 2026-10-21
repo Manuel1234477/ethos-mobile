@@ -45,7 +45,7 @@ class PushTokenRegistrar @Inject constructor(
 
     suspend fun registerSuspending(token: String) {
         try {
-            withRetry(retryPolicy, isRetryable = { true }) {
+            withRetry(retryPolicy, isRetryable = { e -> isRetryableFailure(e) }) {
                 when (val result = registerCall(token)) {
                     is ApiResult.Success -> Unit
                     else -> throw RegistrationFailedException(result)
@@ -56,7 +56,29 @@ class PushTokenRegistrar @Inject constructor(
             tokenProvider.pushToken = token
             tokenProvider.pendingPushToken = null
         } catch (e: RegistrationFailedException) {
-            tokenProvider.pendingPushToken = token
+            if (isRetryableFailure(e)) {
+                // Transient (network / 5xx): keep the token pending so
+                // retryPendingIfNeeded can pick it back up on next foreground.
+                tokenProvider.pendingPushToken = token
+            } else {
+                // Terminal (4xx): the server rejected this token, so retrying
+                // is futile. Clear the pending state instead of looping.
+                tokenProvider.pendingPushToken = null
+            }
+        }
+    }
+
+    /**
+     * Retry only transient failures: network errors and 5xx responses (or an
+     * unknown/zero status). A 4xx means the server rejected the token, so
+     * retrying with backoff would just produce futile requests.
+     */
+    private fun isRetryableFailure(e: Throwable): Boolean {
+        val result = (e as? RegistrationFailedException)?.result ?: return false
+        return when (result) {
+            is ApiResult.NetworkUnavailable -> true
+            is ApiResult.Error -> result.code == 0 || result.code >= 500
+            is ApiResult.Success -> false
         }
     }
 

@@ -169,6 +169,85 @@ final class OfflineCacheSignOutTests: XCTestCase {
     }
 }
 
+// MARK: - Issue #616: Cache Write Failure Tests
+
+final class OfflineCacheWriteFailureTests: XCTestCase {
+
+    override func setUp() {
+        super.setUp()
+        OfflineCache.shared.clearAll()
+    }
+
+    override func tearDown() {
+        OfflineCache.shared.clearAll()
+        super.tearDown()
+    }
+
+    func test_successfulSave_writesPayloadAndTimestampConsistently() {
+        let key = "consistent-\(UUID())"
+        let payload = Data("payload".utf8)
+        let before = Date()
+
+        OfflineCache.shared.save(payload, for: key)
+
+        XCTAssertEqual(OfflineCache.shared.load(for: key), payload)
+        let cachedAt = OfflineCache.shared.cachedAt(for: key)
+        XCTAssertNotNil(cachedAt)
+        XCTAssertGreaterThanOrEqual(cachedAt ?? .distantPast, before.addingTimeInterval(-1))
+        XCTAssertLessThanOrEqual(cachedAt ?? .distantFuture, Date().addingTimeInterval(1))
+    }
+
+    func test_failedPayloadWrite_doesNotUpdateTimestamp() {
+        let key = "write-failure-\(UUID())"
+        let original = Data("original".utf8)
+        OfflineCache.shared.save(original, for: key)
+
+        // Backdate the entry so a timestamp update would be observable.
+        let oldDate = Date().addingTimeInterval(-10_000)
+        setCachedAt(oldDate, for: key)
+        let ageBefore = OfflineCache.shared.age(for: key)
+        XCTAssertNotNil(ageBefore)
+
+        // Make the payload path unwritable by placing a directory where the data file belongs.
+        let dataFile = dataFileURL(for: key)
+        try? FileManager.default.removeItem(at: dataFile)
+        do {
+            try FileManager.default.createDirectory(at: dataFile, withIntermediateDirectories: true)
+        } catch {
+            XCTFail("Failed to set up unwritable payload path: \(error)")
+            return
+        }
+        defer { try? FileManager.default.removeItem(at: dataFile) }
+
+        OfflineCache.shared.save(Data("replacement".utf8), for: key)
+
+        // The failed write must not advance the timestamp past the previous successful save.
+        let cachedAtAfter = OfflineCache.shared.cachedAt(for: key)
+        XCTAssertNotNil(cachedAtAfter)
+        XCTAssertEqual(cachedAtAfter?.timeIntervalSince1970 ?? .nan,
+                       oldDate.timeIntervalSince1970,
+                       accuracy: 0.001,
+                       "Timestamp must not be updated when the payload write fails")
+        let ageAfter = OfflineCache.shared.age(for: key)
+        XCTAssertNotNil(ageAfter)
+        XCTAssertGreaterThanOrEqual(ageAfter ?? 0, (ageBefore ?? 0) - 1,
+                                    "Age must still reflect the previous successful save")
+    }
+
+    private func dataFileURL(for key: String) -> URL {
+        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("EthosProtocolOfflineCache", isDirectory: true)
+        return dir.appendingPathComponent(key.sha256Hex)
+    }
+
+    private func setCachedAt(_ date: Date, for key: String) {
+        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("EthosProtocolOfflineCache", isDirectory: true)
+        let metaFile = dir.appendingPathComponent(key.sha256Hex + ".meta")
+        try? date.timeIntervalSince1970.description.data(using: .utf8)?.write(to: metaFile)
+    }
+}
+
 // MARK: - Issue #244: Concurrent Read/Write Tests
 
 final class OfflineCacheConcurrencyTests: XCTestCase {
