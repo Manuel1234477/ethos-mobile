@@ -69,7 +69,14 @@ object VaultDeepLinkParser {
      */
     private val VAULT_ID_PATTERN = Regex("^[A-Za-z0-9_-]{1,128}$")
 
-    /** True if [vaultId] is safe to interpolate into an API path / navigation route. */
+    /**
+     * True if [vaultId] is safe to interpolate into an API path / navigation route.
+     *
+     * This is the single boundary validator for IDs entering the app: every parser below
+     * rejects IDs that fail this allowlist before they can reach [ApiClient]. ApiClient
+     * additionally re-validates and percent-encodes IDs as defense in depth (#597), so a
+     * caller that bypasses these parsers still cannot smuggle path/query segments.
+     */
     fun isValidVaultId(vaultId: String): Boolean = VAULT_ID_PATTERN.matches(vaultId)
 
     /**
