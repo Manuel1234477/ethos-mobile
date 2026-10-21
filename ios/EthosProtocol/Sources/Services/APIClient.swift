@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import QuartzCore
 
@@ -493,14 +494,16 @@ public final class APIClient {
     // Applied to every mutating request (POST / DELETE). GET requests are
     // idempotent and do not require replay protection.
     //
-    // X-Nonce : 32 cryptographically-random bytes from CryptoKit, hex-encoded.
-    //           The server stores seen nonces and rejects any duplicate within
-    //           the token's validity window.
+    // X-Nonce : 32 cryptographically-random bytes from CryptoKit's
+    //           SymmetricKey(size: .bits256), hex-encoded. The server stores
+    //           seen nonces and rejects any duplicate within the token's
+    //           validity window.
     // X-Timestamp : current Unix epoch in seconds. The server rejects requests
     //               where |server_time − timestamp| > 300 s (5-minute window).
     static func makeAntiReplayHeaders() -> [String: String] {
-        // CryptoKit guarantees OS-CSPRNG quality randomness (SecRandomCopyBytes underneath).
-        let nonceBytes = (0..<32).map { _ in UInt8.random(in: 0...255) }
+        // CryptoKit's SymmetricKey draws from the OS CSPRNG (SecRandomCopyBytes
+        // underneath), matching shared/api-contract.md's nonce contract.
+        let nonceBytes = SymmetricKey(size: .bits256).withUnsafeBytes { Array($0) }
         let nonce = nonceBytes.map { String(format: "%02x", $0) }.joined()
         let timestamp = String(Int(Date().timeIntervalSince1970))
         return ["X-Nonce": nonce, "X-Timestamp": timestamp]

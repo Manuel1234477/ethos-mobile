@@ -279,12 +279,17 @@ class ApiClient(
         if (!circuitBreaker.allowRequest()) return ApiResult.Error("API temporarily unavailable", 503)
         return runCatching {
             val _apmStart = SystemClock.elapsedRealtime()
+            // Serialize once so the exact bytes that are signed are the bytes that are sent.
+            val bodyBytes = Json.encodeToString(
+                kotlinx.serialization.serializer(),
+                body
+            ).toByteArray(Charsets.UTF_8)
             var response = client.post("$baseUrl$path") {
                 standardHeaders()
                 bearerAuth()
-                antiReplayHeaders(idempotencyKey)
+                antiReplayHeaders(HttpMethod.Post, path, bodyBytes, idempotencyKey)
                 contentType(ContentType.Application.Json)
-                setBody(body)
+                setBody(bodyBytes)
             }
             ApiCompressionMetrics.record(response)
             // #609: documented recovery for `replay_detected` (docs/api-error-codes.md) —
@@ -294,9 +299,9 @@ class ApiClient(
                 response = client.post("$baseUrl$path") {
                     standardHeaders()
                     bearerAuth()
-                    antiReplayHeaders(idempotencyKey)
+                    antiReplayHeaders(HttpMethod.Post, path, bodyBytes, idempotencyKey)
                     contentType(ContentType.Application.Json)
-                    setBody(body)
+                    setBody(bodyBytes)
                 }
                 ApiCompressionMetrics.record(response)
             }
@@ -327,12 +332,16 @@ class ApiClient(
         if (!circuitBreaker.allowRequest()) return ApiResult.Error("API temporarily unavailable", 503)
         return runCatching {
             val _apmStart = SystemClock.elapsedRealtime()
+            val bodyBytes = Json.encodeToString(
+                kotlinx.serialization.serializer(),
+                body
+            ).toByteArray(Charsets.UTF_8)
             var response = client.delete("$baseUrl$path") {
                 standardHeaders()
                 bearerAuth()
-                antiReplayHeaders()
+                antiReplayHeaders(HttpMethod.Delete, path, bodyBytes)
                 contentType(ContentType.Application.Json)
-                setBody(body)
+                setBody(bodyBytes)
             }
             ApiCompressionMetrics.record(response)
             // #609: documented recovery for `replay_detected` (docs/api-error-codes.md) —
@@ -341,9 +350,9 @@ class ApiClient(
                 response = client.delete("$baseUrl$path") {
                     standardHeaders()
                     bearerAuth()
-                    antiReplayHeaders()
+                    antiReplayHeaders(HttpMethod.Delete, path, bodyBytes)
                     contentType(ContentType.Application.Json)
-                    setBody(body)
+                    setBody(bodyBytes)
                 }
                 ApiCompressionMetrics.record(response)
             }
@@ -515,22 +524,58 @@ class ApiClient(
     //                  intentionally NOT regenerated per attempt, so the server can recognize
     //                  a resubmission as a duplicate of a specific prior attempt rather than a
     //                  brand-new request.
-    private fun HttpRequestBuilder.antiReplayHeaders(idempotencyKey: String? = null) {
+    private fun HttpRequestBuilder.antiReplayHeaders(
+        method: HttpMethod,
+        path: String,
+        bodyBytes: ByteArray?,
+        idempotencyKey: String? = null
+    ) {
         val nonce = ByteArray(32).also { SecureRandom().nextBytes(it) }
             .joinToString("") { "%02x".format(it) }
         val timestamp = System.currentTimeMillis() / 1_000L
         header("X-Nonce", nonce)
         header("X-Timestamp", timestamp.toString())
-        requestSignature(nonce, timestamp, idempotencyKey)?.let { header("X-Request-Signature", it) }
+        requestSignature(method, path, bodyBytes, nonce, timestamp, idempotencyKey)
+            ?.let { header("X-Request-Signature", it) }
         if (idempotencyKey != null) header("X-Idempotency-Key", idempotencyKey)
     }
 
-    private fun requestSignature(nonce: String, timestamp: Long, idempotencyKey: String?): String? {
-        val token = tokenProvider.token ?: return null
-        val canonical = listOf(nonce, timestamp.toString(), idempotencyKey.orEmpty()).joinToString(":")
+    // #607: The HMAC key must NOT be the bearer token. The bearer token already travels on
+    // every request, so a network observer that captures it could forge a valid MAC — the
+    // signature would add no secrecy. Instead we derive a distinct signing key from the
+    // server-issued session secret (TokenProvider.signingSecret), which is never sent on the
+    // wire. If the server has not issued a signing secret, we omit the header entirely
+    // (issue #56) rather than fall back to the bearer token.
+    //
+    // The canonical string binds the signature to the specific request so a captured
+    // signature cannot be replayed against another endpoint or with a different payload:
+    //   METHOD \n PATH \n SHA-256(body) \n nonce \n timestamp \n idempotencyKey
+    private fun requestSignature(
+        method: HttpMethod,
+        path: String,
+        bodyBytes: ByteArray?,
+        nonce: String,
+        timestamp: Long,
+        idempotencyKey: String?
+    ): String? {
+        val signingSecret = tokenProvider.signingSecret ?: return null
+        val bodyHash = sha256Hex(bodyBytes ?: ByteArray(0))
+        val canonical = listOf(
+            method.value,
+            path,
+            bodyHash,
+            nonce,
+            timestamp.toString(),
+            idempotencyKey.orEmpty()
+        ).joinToString("\n")
         val mac = Mac.getInstance("HmacSHA256")
-        mac.init(SecretKeySpec(token.toByteArray(), "HmacSHA256"))
-        return Base64.encodeToString(mac.doFinal(canonical.toByteArray()), Base64.NO_WRAP)
+        mac.init(SecretKeySpec(signingSecret.toByteArray(Charsets.UTF_8), "HmacSHA256"))
+        return Base64.encodeToString(mac.doFinal(canonical.toByteArray(Charsets.UTF_8)), Base64.NO_WRAP)
+    }
+
+    private fun sha256Hex(bytes: ByteArray): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256").digest(bytes)
+        return digest.joinToString("") { "%02x".format(it) }
     }
 }
 

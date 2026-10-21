@@ -601,6 +601,12 @@ class VaultViewModel @Inject constructor(
     private var nextCursor: String? = null
     private val eventJobs = mutableMapOf<String, Job>()
 
+    // #606: Highest Vault.version applied per vault id. A GET /vaults/{id} started before a
+    // `vault_updated` push but completed after it must not overwrite the newer pushed state,
+    // so every merge path (poll, push, list reload) drops any Vault whose version is not
+    // strictly greater than the one already applied.
+    private val appliedVersions = mutableMapOf<String, Long>()
+
     init {
         // #428: Observe network reachability. When connectivity is restored after an
         // offline period, immediately:
@@ -628,16 +634,28 @@ class VaultViewModel @Inject constructor(
         when (val result = apiClient.listVaults(limit = PAGE_SIZE)) {
             is ApiResult.Success -> {
                 nextCursor = result.data.nextCursor
+                // #606: A list response can also be stale relative to a push received while
+                // it was in flight — keep the newer local copy for any vault whose applied
+                // version is ahead of the one in this response.
+                val merged = result.data.vaults.map { incoming ->
+                    val applied = appliedVersions[incoming.id]
+                    if (applied != null && incoming.version <= applied) {
+                        _state.value.vaults.firstOrNull { it.id == incoming.id } ?: incoming
+                    } else {
+                        appliedVersions[incoming.id] = incoming.version
+                        incoming
+                    }
+                }
                 _state.update {
                     it.copy(
-                        vaults = result.data.vaults,
+                        vaults = merged,
                         isLoading = false,
                         isOffline = false,
                         hasMore = result.data.hasMore
                     )
                 }
-                expiringVaultsManager.updateVaults(result.data.vaults)
-                subscribeToEvents(result.data.vaults.map { it.id })
+                expiringVaultsManager.updateVaults(merged)
+                subscribeToEvents(merged.map { it.id })
             }
             ApiResult.NetworkUnavailable -> {
                 _state.update { it.copy(isLoading = false, isOffline = true) }
@@ -740,6 +758,7 @@ class VaultViewModel @Inject constructor(
     override fun onCleared() {
         eventJobs.values.forEach { it.cancel() }
         eventJobs.clear()
+        appliedVersions.clear()
     }
 
     fun checkIn(vaultId: String) = viewModelScope.launch {
@@ -772,10 +791,14 @@ class VaultViewModel @Inject constructor(
     }
 
     // Shared merge point for both a poll response (refreshSingle) and a `vault_updated`
-    // push (subscribeToEvents) — see the "Reconciling a poll/push disagreement" rule in
-    // api-contract.md (#223): whichever is received last always overwrites in place.
-    // Only updates if the vault is actually different to minimize Compose recomposition churn.
+    // push (subscribeToEvents). #606: last-applied-wins is not enough — a GET started
+    // before a push but completed after it would clobber the newer state, so an incoming
+    // Vault is only applied when its version is strictly greater than the one already
+    // applied for that vault. Equal versions are ignored to avoid needless recomposition.
     private fun updateVaultInPlace(vault: Vault) {
+        val applied = appliedVersions[vault.id]
+        if (applied != null && vault.version <= applied) return
+        appliedVersions[vault.id] = vault.version
         _state.update { state ->
             val updated = state.vaults.map { if (it.id == vault.id) vault else it }
             if (updated === state.vaults) state else state.copy(vaults = updated)

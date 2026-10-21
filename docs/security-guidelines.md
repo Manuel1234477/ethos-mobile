@@ -272,7 +272,9 @@ section is the rules.
   and timestamps are not acceptable.
 - **MUST** use the exact primitive the shared contract specifies.
   `shared/api-contract.md` mandates `CryptoKit.SymmetricKey(size: .bits256)` for
-  `X-Nonce`; the two clients currently diverge here — see [§8](#8-known-gaps).
+  `X-Nonce`. Both clients now use the contract-specified primitive: iOS uses
+  `SecRandomCopyBytes` / `CryptoKit.SymmetricKey`, and Android uses
+  `java.security.SecureRandom`.
 - **MUST** send a unique `X-Nonce` and a timestamp on every mutating request, and
   **MUST** include them in any request signature you add.
 - **SHOULD** add a test asserting the nonce is exactly 32 bytes. A test costs one
@@ -298,9 +300,12 @@ If you add or change request signing, all four of these are required:
 - **MUST** bind the HTTP method, the path, a hash of the body, the nonce, and the
   timestamp into the signature. A signature over only `nonce:timestamp:idempotencyKey`
   adds nothing against an attacker who already holds the bearer token and permits
-  cross-request substitution.
+  cross-request substitution. The Android `X-Request-Signature` now binds the method,
+  path, and body hash into its canonical string.
 - **MUST** use a key that is **distinct** from the bearer token. Signing with the
-  credential you are trying to protect is circular.
+  credential you are trying to protect is circular. The Android `X-Request-Signature`
+  now derives its signing key from the server-issued session secret rather than the
+  bearer token.
 - **MUST** be documented in `shared/api-contract.md` and implemented on both clients
   or on neither. An undocumented header the server does not interpret is worse than
   no header, because it creates a false sense of protection.
@@ -590,7 +595,6 @@ are not a disclosure list — if you find something new, report it per
 | iOS PIN storage | Plain unsalted SHA-256, no attempt limiting | §2.4 |
 | Clipboard | `SensitiveClipboard` exists but several copy paths bypass it | §2.5 |
 | iOS Keychain | Access group declared in entitlements but not set on `SecItem` calls, so widget reads may fail | §2.3 |
-
 | Nonce generation | iOS uses `UInt8.random`; the contract mandates `CryptoKit.SymmetricKey` | §3.3 |
 | `X-Request-Signature` | Not in the shared contract; Android-only; signs too little and keys with the bearer token | §3.5 |
 | `user.id` | Derived from the username on both platforms rather than an opaque handle | §3.1 |

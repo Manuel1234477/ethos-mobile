@@ -338,6 +338,12 @@ final class VaultStore: ObservableObject {
 
     private var eventSocket: VaultEventSocket?
 
+    /// Highest `Vault.version` applied per vault ID. A `GET /vaults` poll started before a
+    /// `vault_updated` push can complete after it; without this, the older poll response
+    /// would overwrite the newer pushed state (#606). Any incoming vault whose version is
+    /// not greater than the recorded one is dropped instead of applied.
+    private var appliedVersions: [String: Int] = [:]
+
     /// Whether a further page is available for VaultListView's "Load More".
     var hasMorePages: Bool { nextCursor != nil }
 
@@ -402,7 +408,7 @@ final class VaultStore: ObservableObject {
             let page = try await APIClient.shared.listVaults()
             ifNotCancelled {
                 let (dedupedVaults, duplicateCount) = deduplicateVaults(page.vaults)
-                vaults = dedupedVaults
+                vaults = mergePolledVaults(dedupedVaults)
                 nextCursor = page.nextCursor
                 if duplicateCount > 0 {
                     let message = duplicateCount == 1
@@ -458,7 +464,7 @@ final class VaultStore: ObservableObject {
             } while cursor != nil
             ifNotCancelled {
                 let (dedupedVaults, duplicateCount) = deduplicateVaults(accumulated)
-                vaults = dedupedVaults
+                vaults = mergePolledVaults(dedupedVaults)
                 if duplicateCount > 0 {
                     let message = duplicateCount == 1
                         ? "Removed 1 duplicate vault from your list"
@@ -555,17 +561,46 @@ final class VaultStore: ObservableObject {
     /// appends it if it isn't currently in `vaults` — e.g. a vault created from another
     /// device that this session hasn't loaded yet.
     ///
-    /// Called for a `vault_updated` push (`subscribeToEvents`). `load`/`loadAll` achieve
-    /// the same outcome for a poll by replacing `vaults` wholesale — either way, whichever
-    /// of a poll or a push is *received* last simply overwrites what was there, with no
-    /// comparison against it. See the "Reconciling a poll/push disagreement" rule in
-    /// api-contract.md (#223).
+    /// Called for a `vault_updated` push (`subscribeToEvents`). Ignores the update if a
+    /// newer version has already been applied, so an out-of-order push can't regress state.
+    /// See the "Reconciling a poll/push disagreement" rule in api-contract.md (#223, #606).
     func applyUpdate(_ updated: Vault) {
+        guard isNewer(updated) else { return }
+        recordApplied(updated)
         if let index = vaults.firstIndex(where: { $0.id == updated.id }) {
             vaults[index] = updated
         } else {
             vaults.append(updated)
         }
+    }
+
+    /// Merges a polled page into `vaults`, keeping whichever side has the higher version for
+    /// each vault. A poll response that started before a `vault_updated` push but completed
+    /// after it carries older data; dropping it here prevents the stale overwrite (#606).
+    private func mergePolledVaults(_ polled: [Vault]) -> [Vault] {
+        var merged: [Vault] = []
+        merged.reserveCapacity(polled.count)
+        for incoming in polled {
+            if let existing = vaults.first(where: { $0.id == incoming.id }), !isNewer(incoming) {
+                // The already-applied copy is at least as new — keep it.
+                merged.append(existing)
+            } else {
+                recordApplied(incoming)
+                merged.append(incoming)
+            }
+        }
+        return merged
+    }
+
+    /// Whether `incoming` is strictly newer than the version already applied for its vault.
+    /// Vaults never seen before are always accepted.
+    private func isNewer(_ incoming: Vault) -> Bool {
+        guard let applied = appliedVersions[incoming.id] else { return true }
+        return incoming.version > applied
+    }
+
+    private func recordApplied(_ vault: Vault) {
+        appliedVersions[vault.id] = max(appliedVersions[vault.id] ?? vault.version, vault.version)
     }
 
     /// Subscribes to real-time vault events (#20) and applies incoming updates to
@@ -618,6 +653,12 @@ final class VaultStore: ObservableObject {
         socketConnectionState = .disconnected
     }
 
+    /// Clears the per-vault applied-version bookkeeping. Called on sign-out so a subsequent
+    /// user on the same device isn't served stale comparisons from the previous account.
+    func resetVersionTracking() {
+        appliedVersions.removeAll()
+    }
+
     private func deduplicateVaults(_ vaults: [Vault]) -> (deduplicated: [Vault], duplicateCount: Int) {
         var seenIDs = Set<String>()
         var deduplicated: [Vault] = []
@@ -646,6 +687,34 @@ final class VaultStore: ObservableObject {
         }
     }
 }
+
+// MARK: - #606 Stale poll/push reconciliation
+
+#if DEBUG
+/// Exercises the out-of-order race from #606: a `GET /vaults` poll started before a
+/// `vault_updated` push, completing after it, must not overwrite the newer pushed state.
+enum VaultStoreVersionRaceTests {
+    @MainActor
+    static func run() {
+        let store = VaultStore()
+        let stale = Vault.fixture(id: "v1", version: 1, balance: 100)
+        let fresh = Vault.fixture(id: "v1", version: 2, balance: 200)
+
+        // Push arrives first with the newer version.
+        store.applyUpdate(fresh)
+        assert(store.vaults.first?.balance == 200, "push should apply")
+
+        // Stale poll response completes afterwards — must be ignored.
+        store.applyUpdate(stale)
+        assert(store.vaults.first?.balance == 200, "stale push must not overwrite newer state")
+
+        // A newer push still applies.
+        let newer = Vault.fixture(id: "v1", version: 3, balance: 300)
+        store.applyUpdate(newer)
+        assert(store.vaults.first?.balance == 300, "newer push should apply")
+    }
+}
+#endif
 
 // MARK: - #120 Disable2FACoordinator
 
