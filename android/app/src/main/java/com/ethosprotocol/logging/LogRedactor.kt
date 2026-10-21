@@ -4,7 +4,8 @@ package com.ethosprotocol.logging
  * Redacts sensitive values from log messages before they are emitted.
  *
  * Covers Bearer tokens, x-nonce values, 6-digit OTPs in otp=/code= fields,
- * otpauth:// provisioning URIs, and token= query parameters (acceptance tokens).
+ * otpauth:// provisioning URIs, token= query parameters (acceptance tokens),
+ * and Stellar G-/M-addresses (beneficiary and owner wallets).
  */
 object LogRedactor {
 
@@ -20,7 +21,11 @@ object LogRedactor {
         // otpauth:// provisioning URIs
         Regex("(?i)otpauth://[^\\s\"']+"),
         // token= query parameters (acceptance tokens from /accept?token=)
-        Regex("(?i)([?&]token=)[^&\\s\"']+")
+        Regex("(?i)([?&]token=)[^&\\s\"']+"),
+        // Stellar M-addresses (69 chars, muxed accounts)
+        Regex("\\bM[A-Z2-7]{68}\\b"),
+        // Stellar G-addresses (56 chars, account IDs)
+        Regex("\\bG[A-Z2-7]{55}\\b")
     )
 
     fun redact(message: String): String {

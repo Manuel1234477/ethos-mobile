@@ -8,6 +8,7 @@ import Foundation
 /// - 6-digit OTPs in `otp=` / `code=` fields
 /// - `otpauth://` provisioning URIs
 /// - `token=` query parameters (e.g. acceptance tokens from `/accept?token=`)
+/// - Stellar G-addresses (56 chars) and M-addresses (69 chars)
 enum LogRedactor {
 
     private static let patterns: [(regex: NSRegularExpression, replacement: String)] = {
@@ -21,7 +22,11 @@ enum LogRedactor {
             // otpauth:// provisioning URIs (redact the whole URI).
             (#"(?i)otpauth://[^\s\"']+"#, "[REDACTED]"),
             // token= query parameters (acceptance tokens from /accept?token=).
-            (#"(?i)([?&]token\s*=\s*)[^\s&,;\"']+"#, "$1[REDACTED]")
+            (#"(?i)([?&]token\s*=\s*)[^\s&,;\"']+"#, "$1[REDACTED]"),
+            // Stellar M-addresses (69 chars, base32) — must precede G-addresses.
+            (#"\bM[A-Z2-7]{68}\b"#, "[REDACTED]"),
+            // Stellar G-addresses (56 chars, base32).
+            (#"\bG[A-Z2-7]{55}\b"#, "[REDACTED]")
         ]
 
         return specs.compactMap { pattern, replacement in
