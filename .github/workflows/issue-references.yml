@@ -1,0 +1,24 @@
+name: Issue References
+
+# Checks that issue numbers cited in code and docs exist. Runs on pull requests
+# and pushes to main, with the default token.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  issue-references:
+    name: Cited issues exist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check cited issue numbers
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/check_issue_refs.py
