@@ -1666,7 +1666,7 @@ struct TwoFactorVerifyView: View {
                 }
                 .padding(.horizontal)
             }
-            Button(action: { UIPasteboard.general.string = backupCodes.joined(separator: "\n") }) {
+            Button(action: { SensitiveClipboard.copy(backupCodes.joined(separator: "\n")) }) {
                 Label("Copy All Codes", systemImage: "doc.on.doc").frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
