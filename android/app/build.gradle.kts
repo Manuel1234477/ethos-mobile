@@ -17,14 +17,34 @@ fun signingProp(envName: String, propName: String): String? =
     System.getenv(envName)?.takeIf { it.isNotBlank() }
         ?: (project.findProperty(propName) as String?)?.takeIf { it.isNotBlank() }
 
-// #173: Certificate pins that will be compiled into a release build. Supplied out of band
-// (CI secret / local gradle.properties) so rotating a pin never needs a source change, and
-// verified before release artifacts ship by .github/scripts/verify_cert_pins.py. When it is
-// blank, CertificatePinner's pin set is empty, which disables pinning (#169) — there is no
-// compiled-in fallback, so an unconfigured build can never pin to an unmatchable value.
+// #593: The certificate pin set is single-sourced in shared/cert-pins.json, which is the
+// source of truth for both Android (this file) and iOS (project.yml -> Info.plist). The
+// shared file is the compiled-in default so rotating a pin only requires editing one place;
+// the CI gate (.github/scripts/check_tls_pinning.py) asserts the generated platform values
+// match it. An out-of-band override (CI secret / local gradle.properties) still wins when
+// set, so a pin can be rotated without a source change in an emergency.
+//
+// When the resolved set is blank, CertificatePinner's pin set is empty, which disables
+// pinning (#169) — there is no compiled-in fallback, so an unconfigured build can never
+// pin to an unmatchable value.
+val sharedCertPinsFile = rootProject.file("../shared/cert-pins.json")
+
+// Minimal JSON read of the shared pin set: the file is a flat object of
+// {"sha256/<base64>": "description", ...} (see shared/cert-pins.json). We avoid pulling in
+// a JSON library at configuration time by extracting the quoted keys with a regex.
+fun readSharedCertPins(): String {
+    if (!sharedCertPinsFile.exists()) return ""
+    val json = sharedCertPinsFile.readText()
+    val pins = Regex("\"([^\"]+)\"\\s*:").findAll(json)
+        .map { it.groupValues[1] }
+        .filter { it.startsWith("sha256/") }
+        .toList()
+    return pins.joinToString(",")
+}
+
 val releaseCertPins = System.getenv("ETHOS_CERT_PINS")?.takeIf { it.isNotBlank() }
     ?: (project.findProperty("ethos.certPins") as String?)?.takeIf { it.isNotBlank() }
-    ?: ""
+    ?: readSharedCertPins()
 
 // #425: Sentry DSN for crash reporting. Supplied out of band (CI secret / local
 // gradle.properties) like the signing credentials above — never hardcoded. When blank,
@@ -62,9 +82,15 @@ android {
         targetSdk = 35
         versionCode = playVersionCode ?: 1
         versionName = "1.0.0"
+        // Enable multidex to support large dependency trees that exceed the 64K method
+        // reference limit per dex file (#430). minSdk = 28 (API 28+) means the platform
+        // provides native multidex support — no legacy androidx.multidex library or
+        // MultiDexApplication subclass is required.
+        multiDexEnabled = true
         buildConfigField("String", "API_BASE_URL", "\"https://api.ethos-protocol.app/v1\"")
         // Empty by default: an empty pin set disables pinning, which is what debug builds
-        // pointing at a local/dev host want. Only the release build type is gated (#173).
+        // pointing at a local/dev host want. Only the release build type is gated (#173);
+        // the release pin set is single-sourced from shared/cert-pins.json (#593).
         buildConfigField("String", "CERT_PINS", "\"\"")
         // #425: Crash reporting DSN. Empty by default (reporting disabled); the release
         // build type injects the out-of-band value below.
@@ -104,6 +130,17 @@ android {
         }
     }
 
+    // #631: Register the custom lint detector (UnguardedVaultIdLog) so it actually runs
+    // during `lint`/`lintDebug`/`lintRelease`. The detector lives in the :lint module and
+    // is wired in via `lintChecks` below; the rule itself is enabled in lint.xml.
+    lint {
+        // Fail the build on the vault-ID logging violation so it can't regress silently.
+        // (Severity is defined by the detector; this just ensures it's treated as an error.)
+        abortOnError = true
+        // Keep the existing lint behavior for everything else intact.
+        checkReleaseBuilds = true
+    }
+
     signingConfigs {
         if (hasReleaseSigningConfig) {
             create("release") {
@@ -126,6 +163,49 @@ android {
                 signingConfig = signingConfigs.getByName("release")
             }
         }
+
+        // Staging build type: points at the staging API, keeps minification on for
+        // parity with Release (catches ProGuard regressions early), but pins are
+        // supplied separately via ETHOS_STAGING_CERT_PINS so the staging certificate
+        // can rotate independently of production. App ID suffix (.staging) lets the
+        // staging and production APKs coexist on the same device.
+        create("staging") {
+            initWith(getByName("release"))
+            // Override API base URL to point at the staging backend.
+            // Supplied at build time via STAGING_API_BASE_URL env var so it never
+            // needs to be hardcoded here (CI injects it; local developers override
+            // via ~/.gradle/gradle.properties: ethos.stagingApiBaseUrl=...).
+            val stagingApiUrl = System.getenv("STAGING_API_BASE_URL")?.takeIf { it.isNotBlank() }
+                ?: (project.findProperty("ethos.stagingApiBaseUrl") as String?)?.takeIf { it.isNotBlank() }
+                ?: "https://staging-api.ethos-protocol.app/v1"
+            buildConfigField("String", "API_BASE_URL", "\"$stagingApiUrl\"")
+
+            // Staging cert pins: empty → pinning disabled (safe for staging; staging
+            // cert is separate from production and may rotate frequently during testing).
+            // Falls back to the shared pin set (#593) so staging is pinned by default too.
+            val stagingCertPins = System.getenv("ETHOS_STAGING_CERT_PINS")?.takeIf { it.isNotBlank() }
+                ?: (project.findProperty("ethos.stagingCertPins") as String?)?.takeIf { it.isNotBlank() }
+                ?: readSharedCertPins()
+            buildConfigField("String", "CERT_PINS", "\"$stagingCertPins\"")
+
+            // Distinct application ID so the staging APK can be installed alongside
+            // the production app on the same device for side-by-side testing.
+            applicationIdSuffix = ".staging"
+            versionNameSuffix = "-staging"
+            isMinifyEnabled = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            // Staging builds are not signed for distribution (CI just verifies the APK
+            // builds cleanly); add a signingConfig here when distributing via Firebase
+            // App Distribution or a similar staging distribution channel.
+        }
+    }
+
+    // #611: Room schema export. Room's KSP processor writes the generated schema JSON for
+    // every @Database version into $projectDir/schemas (committed to VCS), and the
+    // androidTest source set reads them back as assets so MigrationTestHelper can validate
+    // each version step against the real, historical schemas.
+    sourceSets {
+        getByName("androidTest").assets.srcDir("$projectDir/schemas")
     }
 
     compileOptions {
@@ -143,6 +223,19 @@ android {
             "-opt-in=androidx.compose.material3.ExperimentalMaterial3Api",
         )
     }
+}
+
+// #611: Point Room's schema export at a committed directory so the generated JSON is
+// available to MigrationTestHelper in androidTest (see the androidTest assets srcDir above).
+ksp {
+    arg("room.schemaLocation", "$projectDir/schemas")
+}
+
+dependencies {
+    // #631: Custom lint detector (UnguardedVaultIdLog) that flags unguarded vaultId in
+    // Log.* calls. `lintChecks` makes the detector run as part of this module's lint
+    // tasks without packaging it into the app. The rule is enabled in lint.xml.
+    lintChecks(project(":lint"))
 }
 
 // JUnit pulls in org.hamcrest:hamcrest-core:1.3, which espresso-core (transitively required
@@ -183,171 +276,4 @@ configurations.all {
         //  CVE-2026-45416/45536/45673/45674, CVE-2026-46340, CVE-2026-47244/47691,
         //  CVE-2026-48006/48043/48059, CVE-2026-50010/50011/50020/50560,
         //  CVE-2026-55831/55833/55851, CVE-2026-56745/56746/56817/56819-56822,
-        //  CVE-2026-59898-59901/59919-59921, CVE-2025-55163/58056/58057/67735).
-        force("io.netty:netty-buffer:4.1.137.Final")
-        force("io.netty:netty-codec:4.1.137.Final")
-        force("io.netty:netty-codec-http:4.1.137.Final")
-        force("io.netty:netty-codec-http2:4.1.137.Final")
-        force("io.netty:netty-codec-socks:4.1.137.Final")
-        force("io.netty:netty-common:4.1.137.Final")
-        force("io.netty:netty-handler:4.1.137.Final")
-        force("io.netty:netty-handler-proxy:4.1.137.Final")
-        force("io.netty:netty-resolver:4.1.137.Final")
-        force("io.netty:netty-transport:4.1.137.Final")
-        force("io.netty:netty-transport-native-unix-common:4.1.137.Final")
-        force("io.netty:netty-transport-native-epoll:4.1.137.Final")
-        force("io.netty:netty-transport-native-kqueue:4.1.137.Final")
-
-        // commons-io: patched for CVE-2024-47554 (XmlStreamReader CPU exhaustion)
-        force("commons-io:commons-io:2.22.0")
-
-        // protobuf-java: patched for CVE-2024-7254 (StackOverflow via nested fields)
-        force("com.google.protobuf:protobuf-java:3.25.5")
-        force("com.google.protobuf:protobuf-java-util:3.25.5")
-
-        // guava: patched for CVE-2023-2976 / CVE-2020-8908 (insecure temp-file creation)
-        force("com.google.guava:guava:33.6.0-jre")
-        force("com.google.guava:guava:33.6.0-android")
-    }
-}
-
-dependencies {
-    testImplementation("org.hamcrest:hamcrest:2.2")
-
-    // Compose BOM
-    implementation(platform(libs.compose.bom))
-    implementation(libs.compose.ui)
-    implementation(libs.compose.material3)
-    implementation(libs.compose.ui.tooling.preview)
-    implementation(libs.compose.material.icons.extended)
-    implementation(libs.activity.compose)
-    implementation(libs.navigation.compose)
-    debugImplementation(libs.compose.ui.tooling)
-
-    // Lifecycle / ViewModel
-    implementation(libs.lifecycle.viewmodel.compose)
-    implementation(libs.lifecycle.runtime.compose)
-
-    // Hilt DI
-    implementation(libs.hilt.android)
-    ksp(libs.hilt.compiler)
-    implementation(libs.hilt.navigation.compose)
-
-    // Networking
-    implementation(libs.ktor.client.android)
-    implementation(libs.ktor.client.content.negotiation)
-    implementation(libs.ktor.serialization.kotlinx.json)
-    implementation(libs.ktor.client.logging)
-    implementation(libs.ktor.client.websockets)
-
-    // Serialization
-    implementation(libs.kotlinx.serialization.json)
-
-    // DataStore (offline)
-    implementation(libs.datastore.preferences)
-
-    // Biometric authentication
-    implementation(libs.biometric)
-
-    // Encrypted local storage (auth token)
-    implementation(libs.security.crypto)
-
-    // Credentials (Passkey)
-    implementation(libs.credentials)
-    implementation(libs.credentials.play.services.auth)
-
-    // Firebase Messaging (push notifications)
-    implementation(platform(libs.firebase.bom))
-    implementation(libs.firebase.messaging)
-
-    // Room (offline check-in queue)
-    implementation(libs.room.runtime)
-    implementation(libs.room.ktx)
-    ksp(libs.room.compiler)
-
-    // WorkManager
-    implementation(libs.work.runtime.ktx)
-
-    // Hilt WorkManager integration
-    implementation(libs.hilt.work)
-    ksp(libs.hilt.work.compiler)
-
-    // Testing
-    testImplementation(libs.junit)
-    testImplementation(libs.kotlinx.coroutines.test)
-    testImplementation(libs.mockk)
-    testImplementation(libs.ktor.client.mock)
-    testImplementation(libs.robolectric)
-    testImplementation(libs.androidx.test.ext)
-    testImplementation(libs.work.testing)
-    testImplementation(platform(libs.compose.bom))
-    testImplementation(libs.compose.ui.test.junit4)
-    // Provides the AndroidManifest.xml entry declaring androidx.activity.ComponentActivity
-    // as a launchable activity — createComposeRule() hosts its composition in one under the
-    // hood, and without this, Robolectric has nothing to resolve that launch Intent against
-    // even with a real app manifest merged in (isIncludeAndroidResources above). Must be
-    // debugImplementation, not testImplementation: Robolectric's unit tests reuse the debug
-    // variant's merged manifest, which is built from implementation/debugImplementation
-    // dependencies — testImplementation artifacts are on the test classpath but never
-    // contribute to that manifest merge.
-    debugImplementation(libs.compose.ui.test.manifest)
-    androidTestImplementation(libs.androidx.test.ext)
-    androidTestImplementation(libs.espresso.core)
-    androidTestImplementation(platform(libs.compose.bom))
-    androidTestImplementation(libs.compose.ui.test.junit4)
-    androidTestImplementation(libs.mockk.android)
-    // @HiltAndroidTest / HiltAndroidRule, used by the instrumented tests under androidTest/.
-    androidTestImplementation(libs.hilt.android.testing)
-    kspAndroidTest(libs.hilt.compiler)
-    // Espresso accessibility-checks module + the Android Accessibility Test Framework (ATF)
-    // itself, used by AccessibilityScanTest to guard minimum touch target size (and other a11y
-    // checks) in CI.
-    androidTestImplementation("androidx.test.espresso:espresso-accessibility:3.6.1")
-    androidTestImplementation("com.google.android.apps.common.testing.accessibility.framework:accessibility-test-framework:4.0.0")
-    // Macrobenchmark library for startup performance profiling (#322)
-    androidTestImplementation(libs.benchmark.macro)
-}
-
-// JaCoCo code coverage configuration
-jacoco {
-    toolVersion = "0.8.11"
-}
-
-tasks.withType<Test>().configureEach {
-    configure<JacocoTaskExtension> {
-        isIncludeNoLocationClasses = true
-        excludes = listOf("jdk.internal.*")
-    }
-}
-
-tasks.register<JacocoReport>("jacocoTestReport") {
-    dependsOn(tasks.named("testDebugUnitTest"))
-    group = "Coverage"
-    description = "Generate JaCoCo coverage report for unit tests"
-
-    reports {
-        xml.required = true
-        html.required = true
-        csv.required = false
-    }
-
-    sourceDirectories.setFrom(
-        files(
-            "${project.projectDir}/src/main/java",
-            "${project.projectDir}/src/main/kotlin"
-        )
-    )
-
-    classDirectories.setFrom(
-        files(
-            fileTree(project.layout.buildDirectory.dir("intermediates/classes/debug/")),
-            fileTree(project.layout.buildDirectory.dir("tmp/kotlin-classes/debug/"))
-        )
-    )
-
-    executionData.setFrom(
-        files(
-            project.layout.buildDirectory.file("jacoco/testDebugUnitTest.exec")
-        )
-    )
-}
+        //  CVE-2026-59898-59901/5

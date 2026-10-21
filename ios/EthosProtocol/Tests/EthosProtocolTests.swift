@@ -1230,6 +1230,22 @@ final class SensitiveClipboardTests: XCTestCase {
         XCTAssertLessThanOrEqual(SensitiveClipboard.clearDelaySeconds, 300,
             "Auto-clear delay must not exceed 5 minutes — longer delays provide no clipboard protection")
     }
+
+    func test_pasteboardOptions_setsExpirationDate() {
+        let before = Date()
+        let options = SensitiveClipboard.pasteboardOptions(expiresIn: 60)
+        guard let expiration = options[.expirationDate] as? Date else {
+            return XCTFail("pasteboardOptions must set an expirationDate")
+        }
+        XCTAssertEqual(expiration.timeIntervalSince(before), 60, accuracy: 1,
+            "Expiration must be the requested delay from now")
+    }
+
+    func test_pasteboardOptions_isLocalOnly() {
+        let options = SensitiveClipboard.pasteboardOptions(expiresIn: 60)
+        XCTAssertEqual(options[.localOnly] as? Bool, true,
+            "Sensitive copies must not sync to other devices via Universal Clipboard")
+    }
 }
 
 // MARK: - #271 KeychainService Accessibility Audit Tests
