@@ -17,20 +17,28 @@ final class KeychainService {
     private let pinKey = "com.ethosprotocol.biometric_fallback_pin"
     private let pinSetupKey = "com.ethosprotocol.pin_setup_complete"
 
+    /// Shared keychain access group declared in both EthosProtocol.entitlements and
+    /// TTLWidget.entitlements (#622). Every SecItem query sets this so the widget
+    /// extension can read items written by the app.
+    private let accessGroup = "$(AppIdentifierPrefix)com.ethosprotocol.shared"
+
     /// `expiresAt`, when provided, is persisted alongside the token so AuthStore can
     /// schedule a proactive refresh (#3) against `AuthToken.expiresAt` even across an
     /// app relaunch, not just for the lifetime of the in-memory session that fetched it.
-    func saveToken(_ token: String, expiresAt: Date? = nil) {
+    @discardableResult
+    func saveToken(_ token: String, expiresAt: Date? = nil) -> OSStatus {
         // The auth token must be readable by BackgroundRefreshService's BGAppRefreshTask and by
         // the TTLWidget extension's timeline provider, both of which can run while the device is
         // still locked. `.WhenUnlockedThisDeviceOnly` would make `loadToken()` silently return nil
         // in that case (the request goes out with no Authorization header, and the background
         // TTL check / widget just fail quietly) — so this needs the AfterFirstUnlock variant.
-        save(token, forKey: tokenKey, accessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly)
+        let tokenStatus = save(token, forKey: tokenKey, accessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly)
+        guard tokenStatus == errSecSuccess else { return tokenStatus }
         if let expiresAt {
-            save(String(expiresAt.timeIntervalSince1970), forKey: tokenExpiryKey,
-                 accessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly)
+            return save(String(expiresAt.timeIntervalSince1970), forKey: tokenExpiryKey,
+                        accessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly)
         }
+        return tokenStatus
     }
 
     func loadToken() -> String? {
@@ -47,7 +55,41 @@ final class KeychainService {
         delete(forKey: tokenExpiryKey)
     }
 
-    func saveCredentialID(_ id: String) {
+    // MARK: - Issue #476: per-account scoped token storage
+    //
+    // The "active" token/expiry (above) stays a single fixed slot so the rest
+    // of the app (AuthStore, APIClient, background refresh, the TTL widget)
+    // keeps reading/writing it exactly as before. These scoped variants let
+    // AccountManager archive an outgoing account's token before overwriting
+    // the active slot with an incoming account's, instead of discarding it.
+
+    func saveToken(_ token: String, expiresAt: Date?, accountId: String) {
+        save(token, forKey: scopedTokenKey(accountId), accessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly)
+        if let expiresAt {
+            save(String(expiresAt.timeIntervalSince1970), forKey: scopedTokenExpiryKey(accountId),
+                 accessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly)
+        }
+    }
+
+    func loadToken(accountId: String) -> String? {
+        load(forKey: scopedTokenKey(accountId))
+    }
+
+    func loadTokenExpiry(accountId: String) -> Date? {
+        guard let raw = load(forKey: scopedTokenExpiryKey(accountId)), let interval = TimeInterval(raw) else { return nil }
+        return Date(timeIntervalSince1970: interval)
+    }
+
+    func deleteToken(accountId: String) {
+        delete(forKey: scopedTokenKey(accountId))
+        delete(forKey: scopedTokenExpiryKey(accountId))
+    }
+
+    private func scopedTokenKey(_ accountId: String) -> String { "\(tokenKey).\(accountId)" }
+    private func scopedTokenExpiryKey(_ accountId: String) -> String { "\(tokenExpiryKey).\(accountId)" }
+
+    @discardableResult
+    func saveCredentialID(_ id: String) -> OSStatus {
         save(id, forKey: credentialKey)
     }
 
@@ -62,7 +104,8 @@ final class KeychainService {
     /// Tracks the device push token last successfully registered with the server,
     /// so AuthStore.signOut() knows what to unregister without needing a fresh
     /// UIApplication device-token callback at sign-out time.
-    func savePushToken(_ token: String) {
+    @discardableResult
+    func savePushToken(_ token: String) -> OSStatus {
         save(token, forKey: pushTokenKey)
     }
 
@@ -76,7 +119,8 @@ final class KeychainService {
 
     /// #234: a device token that failed registration after retrying, to be
     /// retried again the next time the app comes to the foreground.
-    func savePendingPushToken(_ token: String) {
+    @discardableResult
+    func savePendingPushToken(_ token: String) -> OSStatus {
         save(token, forKey: pendingPushTokenKey)
     }
 
@@ -88,9 +132,13 @@ final class KeychainService {
         delete(forKey: pendingPushTokenKey)
     }
 
-    func savePIN(_ pin: String) {
-        save(derivePINRecord(pin), forKey: pinKey, accessible: kSecAttrAccessibleWhenUnlockedThisDeviceOnly)
-        UserDefaults.standard.set(true, forKey: pinSetupKey)
+    @discardableResult
+    func savePIN(_ pin: String) -> OSStatus {
+        let status = save(derivePINRecord(pin), forKey: pinKey, accessible: kSecAttrAccessibleWhenUnlockedThisDeviceOnly)
+        if status == errSecSuccess {
+            UserDefaults.standard.set(true, forKey: pinSetupKey)
+        }
+        return status
     }
 
     /// Verifies `pin` against the stored record. Returns `true` on a match.
@@ -235,22 +283,42 @@ final class KeychainService {
         return diff == 0
     }
 
-    private func save(_ value: String, forKey key: String, accessible: CFString = kSecAttrAccessibleWhenUnlockedThisDeviceOnly) {
+    /// #623: updates an existing item instead of delete-then-add, so a failed write
+    /// can't leave the keychain empty. Returns the OSStatus so callers can surface
+    /// a failed save rather than silently signing the user out.
+    @discardableResult
+    private func save(_ value: String, forKey key: String, accessible: CFString = kSecAttrAccessibleWhenUnlockedThisDeviceOnly) -> OSStatus {
         let data = Data(value.utf8)
-        let query: [CFString: Any] = [
+        let baseQuery: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrAccount: key,
-            kSecValueData: data,
-            kSecAttrAccessible: accessible
+            kSecAttrAccessGroup: accessGroup
         ]
-        SecItemDelete(query as CFDictionary)
-        SecItemAdd(query as CFDictionary, nil)
+
+        var existsQuery = baseQuery
+        existsQuery[kSecReturnData] = false
+        existsQuery[kSecMatchLimit] = kSecMatchLimitOne
+        let existsStatus = SecItemCopyMatching(existsQuery as CFDictionary, nil)
+
+        if existsStatus == errSecSuccess {
+            let attributes: [CFString: Any] = [
+                kSecValueData: data,
+                kSecAttrAccessible: accessible
+            ]
+            return SecItemUpdate(baseQuery as CFDictionary, attributes as CFDictionary)
+        }
+
+        var addQuery = baseQuery
+        addQuery[kSecValueData] = data
+        addQuery[kSecAttrAccessible] = accessible
+        return SecItemAdd(addQuery as CFDictionary, nil)
     }
 
     private func load(forKey key: String) -> String? {
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrAccount: key,
+            kSecAttrAccessGroup: accessGroup,
             kSecReturnData: true,
             kSecMatchLimit: kSecMatchLimitOne
         ]
@@ -261,7 +329,11 @@ final class KeychainService {
     }
 
     private func delete(forKey key: String) {
-        let query: [CFString: Any] = [kSecClass: kSecClassGenericPassword, kSecAttrAccount: key]
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrAccount: key,
+            kSecAttrAccessGroup: accessGroup
+        ]
         SecItemDelete(query as CFDictionary)
     }
 }

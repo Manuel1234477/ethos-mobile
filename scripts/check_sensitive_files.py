@@ -11,6 +11,7 @@ committed to the repository, as they contain credentials or sensitive config:
 - Mobile provisioning profiles (.mobileprovision)
 """
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -28,49 +29,61 @@ SENSITIVE_PATTERNS = [
 ]
 
 
+def parse_staged_names(output):
+    """Split `git diff -z --name-only` output. Names are NUL-separated, so non-ASCII names stay unquoted."""
+    return [name for name in output.split("\0") if name]
+
+
 def get_staged_files():
     """Get list of staged files from git."""
     try:
         result = subprocess.run(
-            ["git", "diff", "--cached", "--name-only"],
+            ["git", "diff", "--cached", "-z", "--name-only"],
             capture_output=True,
             text=True,
             check=True,
         )
-        return result.stdout.strip().split("\n") if result.stdout.strip() else []
+        return parse_staged_names(result.stdout)
     except subprocess.CalledProcessError as e:
         print(f"Error getting staged files: {e}", file=sys.stderr)
         return []
 
 
+# Literal markers that are a secret on their own.
+LITERAL_PATTERNS = [
+    "PRIVATE KEY",
+    "private_key",
+    "BEGIN RSA PRIVATE KEY",
+    "BEGIN OPENSSH PRIVATE KEY",
+    "aws_access_key_id",
+    "aws_secret_access_key",
+    "ETHOS_CERT_PINS",
+    "ethos.certPins",
+]
+
+# Keyword names count only when assigned a quoted value, so docs that mention
+# them (for example "set a strong password") do not block the commit.
+ASSIGNED_KEYWORD = re.compile(
+    r"(password|passwd|secret|api[_-]?key|serviceaccount|firebase)[\w.-]*\s*[:=]\s*[\"'][^\"']{4,}[\"']",
+    re.IGNORECASE,
+)
+
+
 def check_file_for_secrets(file_path):
     """Check a file for common secret patterns."""
-    sensitive_patterns = [
-        "PRIVATE KEY",
-        "private_key",
-        "BEGIN RSA PRIVATE KEY",
-        "BEGIN OPENSSH PRIVATE KEY",
-        "aws_access_key_id",
-        "aws_secret_access_key",
-        "ETHOS_CERT_PINS",
-        "ethos.certPins",
-        "API_KEY",
-        "api_key",
-        "SECRET",
-        "password",
-        "passwd",
-        "firebase",
-        "serviceAccount",
-    ]
-
     try:
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
             content = f.read()
-            for pattern in sensitive_patterns:
-                if pattern.lower() in content.lower():
-                    return True, pattern
     except Exception:
-        pass
+        return False, None
+
+    for pattern in LITERAL_PATTERNS:
+        if pattern.lower() in content.lower():
+            return True, pattern
+
+    match = ASSIGNED_KEYWORD.search(content)
+    if match:
+        return True, match.group(1)
     return False, None
 
 

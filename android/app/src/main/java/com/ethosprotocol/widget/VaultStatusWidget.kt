@@ -8,7 +8,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
 import android.net.Uri
+import android.os.BatteryManager
 import android.os.Bundle
+import android.util.Log
 import android.widget.RemoteViews
 import androidx.hilt.work.HiltWorker
 import androidx.work.*
@@ -314,6 +316,10 @@ class VaultWidgetUpdateWorker @AssistedInject constructor(
 ) : CoroutineWorker(context, params) {
 
     override suspend fun doWork(): Result {
+        // #484: Power usage metric for this background wake-up, so battery drain from
+        // widget refreshes is observable (e.g. via logcat/bug reports) instead of opaque.
+        logBatterySnapshot()
+
         val result = apiClient.listVaults()
         if (result is ApiResult.Success) {
             val vaults = result.data.filter { it.status == VaultStatus.active }
@@ -414,8 +420,19 @@ class VaultWidgetUpdateWorker @AssistedInject constructor(
         return DateTimeFormatter.formatDurationInSeconds(seconds)
     }
 
+    /** #484: Logs battery level/charging state at the start of a background refresh. */
+    private fun logBatterySnapshot() {
+        runCatching {
+            val batteryManager = applicationContext.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+            val level = batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+            val isCharging = batteryManager.isCharging
+            Log.d(TAG, "widget refresh starting battery=$level% charging=$isCharging")
+        }
+    }
+
     companion object {
         const val WORK_NAME = "vault_widget_update"
+        private const val TAG = "VaultWidgetUpdateWorker"
 
         // WorkManager enforces a 15-minute floor on periodic work, so that's the shortest
         // interval available for a vault close to expiring. Once it's not urgent, back off
@@ -423,6 +440,12 @@ class VaultWidgetUpdateWorker @AssistedInject constructor(
         private const val URGENT_INTERVAL_MINUTES = 15L
         private const val NORMAL_INTERVAL_MINUTES = 60L
         private const val URGENCY_THRESHOLD_SECONDS = 86_400L // 24h, matches Vault.isExpiringSoon
+
+        // #484: Flex window applied to the non-urgent schedule only (15 min is already
+        // WorkManager's periodic-interval floor, leaving no room for a flex window there).
+        // This lets the OS fire the refresh any time in the last 15 minutes of the 60-minute
+        // window, batching it with other scheduled wake-ups instead of forcing an exact tick.
+        private const val NORMAL_FLEX_MINUTES = 15L
 
         /** Picks the widget refresh interval based on how close the most urgent vault is to expiring. */
         internal fun determineUpdateInterval(ttlRemainingSeconds: Long?): Long =
@@ -433,13 +456,28 @@ class VaultWidgetUpdateWorker @AssistedInject constructor(
             }
 
         fun schedule(context: Context, intervalMinutes: Long = NORMAL_INTERVAL_MINUTES) {
-            val request = PeriodicWorkRequestBuilder<VaultWidgetUpdateWorker>(intervalMinutes, TimeUnit.MINUTES)
-                .setConstraints(
-                    Constraints.Builder()
-                        .setRequiredNetworkType(NetworkType.CONNECTED)
-                        .build()
-                )
+            val isUrgent = intervalMinutes <= URGENT_INTERVAL_MINUTES
+
+            val constraints = Constraints.Builder()
+                .setRequiredNetworkType(NetworkType.CONNECTED)
+                .apply {
+                    // #484: A non-urgent refresh can wait for a healthier battery state;
+                    // an urgent (vault-expiring-soon) refresh still runs regardless.
+                    if (!isUrgent) setRequiresBatteryNotLow(true)
+                }
                 .build()
+
+            // #484: Only the non-urgent schedule gets a flex window — at the 15-minute
+            // floor there's no room for one (flex requires interval - flex >= 15 min).
+            val request = if (isUrgent) {
+                PeriodicWorkRequestBuilder<VaultWidgetUpdateWorker>(intervalMinutes, TimeUnit.MINUTES)
+            } else {
+                PeriodicWorkRequestBuilder<VaultWidgetUpdateWorker>(
+                    intervalMinutes, TimeUnit.MINUTES,
+                    NORMAL_FLEX_MINUTES, TimeUnit.MINUTES
+                )
+            }.setConstraints(constraints).build()
+
             WorkManager.getInstance(context).enqueueUniquePeriodicWork(
                 WORK_NAME,
                 ExistingPeriodicWorkPolicy.UPDATE,

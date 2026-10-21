@@ -261,12 +261,12 @@ final class ICloudSyncServiceTests: XCTestCase {
         XCTAssertEqual(ICloudSyncService.shared.credentialID(for: "vault-b", accountID: "account-b"), "account-b-cred")
     }
 
-    func test_pushAssociations_doesNotClobberNewerRemoteEntryForUntouchedVault() {
+    func test_pushAssociations_doesNotClobberNewerRemoteEntryForUntouchedVault() throws {
         // Simulates the double check-in race end-to-end: Device A pushes its local state
         // (which knows nothing about vault-2) after Device B already pushed a newer entry
         // for vault-2. Device A's push must not delete vault-2's association from iCloud.
-        try? XCTSkipIf(ProcessInfo.processInfo.environment["CI"] != nil,
-                      "NSUbiquitousKeyValueStore requires an iCloud entitlement + signed-in account, unavailable in CI")
+        try XCTSkipIf(ProcessInfo.processInfo.environment["CI"] != nil,
+                  "NSUbiquitousKeyValueStore requires an iCloud entitlement + signed-in account, unavailable in CI")
         let deviceBAssoc = ICloudSyncService.VaultAssociation(credentialID: "device-b-cred", timestamp: Date().timeIntervalSince1970)
         if let data = try? JSONEncoder().encode(["vault-2": deviceBAssoc]) {
             NSUbiquitousKeyValueStore.default.set(data, forKey: "com.ethosprotocol.vault_associations")

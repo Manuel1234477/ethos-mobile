@@ -25,6 +25,11 @@
 
 set -euo pipefail
 
+# Private work directory: parallel runs cannot read each other's files.
+WORK_DIR="$(mktemp -d)"
+export WORK_DIR
+trap 'rm -rf "$WORK_DIR"' EXIT
+
 AASA_URL="${AASA_URL:-https://ethos-protocol.app/.well-known/apple-app-site-association}"
 BUNDLE_ID="${BUNDLE_ID:-com.ethosprotocol}"
 TEAM_IDENTIFIER="${TEAM_IDENTIFIER:-}"
@@ -49,11 +54,11 @@ FAIL=0
 # ── 1. Fetch ──────────────────────────────────────────────────────────────────
 echo "Fetching: $AASA_URL"
 CURL_EXIT=0
-HTTP_CODE=$(curl --silent --output /tmp/aasa.json \
+HTTP_CODE=$(curl --silent --output "$WORK_DIR/aasa.json" \
                  --write-out "%{http_code}" \
                  --max-time 15 \
                  --fail-with-body \
-                 "$AASA_URL" 2>/tmp/aasa_err.txt) || CURL_EXIT=$?
+                 "$AASA_URL" 2>"$WORK_DIR/aasa_err.txt") || CURL_EXIT=$?
 
 # curl never reached the server, so there is no HTTP status to report
 if [[ "$CURL_EXIT" -ne 0 && "$HTTP_CODE" == "000" ]]; then
@@ -65,19 +70,19 @@ if [[ "$CURL_EXIT" -ne 0 && "$HTTP_CODE" == "000" ]]; then
         *)  REASON="curl failed with exit code $CURL_EXIT" ;;
     esac
     echo "ERROR: $AASA_URL is unreachable: $REASON" >&2
-    cat /tmp/aasa_err.txt >&2 2>/dev/null || true
+    cat "$WORK_DIR/aasa_err.txt" >&2 2>/dev/null || true
     exit 1
 fi
 
 if [[ "$HTTP_CODE" != "200" ]]; then
     echo "ERROR: Expected HTTP 200, got $HTTP_CODE" >&2
-    cat /tmp/aasa_err.txt >&2 2>/dev/null || true
+    cat "$WORK_DIR/aasa_err.txt" >&2 2>/dev/null || true
     exit 1
 fi
 echo "OK: HTTP $HTTP_CODE"
 
 # ── 2. Valid JSON ─────────────────────────────────────────────────────────────
-if ! python3 -c "import json,sys; json.load(sys.stdin)" < /tmp/aasa.json; then
+if ! python3 -c "import json,sys; json.load(sys.stdin)" < "$WORK_DIR/aasa.json"; then
     echo "ERROR: apple-app-site-association is not valid JSON" >&2
     FAIL=1
 else
@@ -87,7 +92,7 @@ fi
 # ── 3. applinks section present ───────────────────────────────────────────────
 if python3 - "$BUNDLE_ID" "$TEAM_IDENTIFIER" <<'PY'
 import json, sys
-data = json.load(open("/tmp/aasa.json"))
+data = json.load(open(__import__("os").environ["WORK_DIR"] + "/aasa.json"))
 bundle_id = sys.argv[1]
 team_id = sys.argv[2]
 
@@ -123,7 +128,7 @@ fi
 # ── 4. webcredentials section present ─────────────────────────────────────────
 if python3 - "$BUNDLE_ID" "$TEAM_IDENTIFIER" <<'PY'
 import json, sys
-data = json.load(open("/tmp/aasa.json"))
+data = json.load(open(__import__("os").environ["WORK_DIR"] + "/aasa.json"))
 bundle_id = sys.argv[1]
 team_id = sys.argv[2]
 
