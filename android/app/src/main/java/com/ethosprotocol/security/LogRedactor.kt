@@ -105,6 +105,26 @@ object LogRedactor {
     // -------------------------------------------------------------------------
 
     /**
+     * Query parameter names whose values must be redacted when they appear in a
+     * URL or query string (#638/#639). Matching is case-insensitive.
+     */
+    private val SENSITIVE_QUERY_PARAMS: Set<String> = setOf(
+        "token",
+        "code",
+        "otp",
+        "secret",
+        "key"
+    )
+
+    /**
+     * Matches `name=value` pairs for the sensitive query parameters above. The
+     * value is captured up to the next `&`, `#`, whitespace, or end of string.
+     */
+    private val QUERY_PARAM_REGEX = Regex(
+        pattern = """(?i)\b(token|code|otp|secret|key)=([^&#\s]*)"""
+    )
+
+    /**
      * Replaces all six contract-mandated sensitive patterns in [input] with
      * safe placeholders.
      *
@@ -153,6 +173,12 @@ object LogRedactor {
 
         // Category 5b – token JSON field
         result = TOKEN_JSON_FIELD_REGEX.replace(result, """"token": "[REDACTED]"""")
+
+        // #638/#639: other sensitive query parameters (code, otp, secret, key) in URLs.
+        result = QUERY_PARAM_REGEX.replace(result) { match ->
+            val name = match.groupValues[1]
+            if (SENSITIVE_QUERY_PARAMS.contains(name.lowercase())) "$name=[REDACTED]" else match.value
+        }
 
         // Category 6 – request / response body
         result = BODY_LOG_REGEX.replace(result) { match ->
