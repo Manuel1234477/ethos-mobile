@@ -252,7 +252,7 @@ jobs:
 
       - name: Measure app size
         run: |
-          python3 "$GITHUB_WORKSPACE/.github/scripts/track_build_size.py" ios
+          python3 "$GITHUB_WORKSPACE/.github/scripts/track_build_size.py" ios "${{ vars.IOS_BASE_SIZE_MB }}"
 
       # Runs hosted tests that require a real app process (Keychain, UNUserNotificationCenter).
       # These tests are in EthosProtocolTests target within the Xcode project, not in the SPM

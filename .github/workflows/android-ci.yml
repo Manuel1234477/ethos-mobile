@@ -160,7 +160,7 @@ jobs:
 
       - name: Measure APK size
         run: |
-          python3 ../.github/scripts/track_build_size.py android
+          python3 ../.github/scripts/track_build_size.py android "${{ vars.ANDROID_BASE_SIZE_MB }}"
 
       # task #173: A release build must never ship placeholder certificate pins — the
       # failure mode is silent until every user hits a connection failure in production.

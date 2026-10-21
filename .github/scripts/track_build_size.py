@@ -128,11 +128,18 @@ def main():
 
     platform = sys.argv[1].lower()
     base_size_mb = None
-    if len(sys.argv) > 2:
+    if len(sys.argv) > 2 and sys.argv[2].strip():
         try:
             base_size_mb = float(sys.argv[2])
         except ValueError:
             pass
+
+    if base_size_mb is None and os.environ.get("GITHUB_REF") == "refs/heads/main":
+        print(
+            f"::error::No {platform} size baseline on main. "
+            f"Set the {platform.upper()}_BASE_SIZE_MB repository variable so the 5% check can run."
+        )
+        sys.exit(1)
 
     if platform == "android":
         result = track_android_size(base_size_mb)
