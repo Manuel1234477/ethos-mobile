@@ -72,13 +72,15 @@ class ApiClient(
     engine: HttpClientEngine = Android.create {
         sslManager = { httpsURLConnection ->
             val systemTm = getSystemTrustManager()
-            if (systemTm != null) {
-                val pinner = CertificatePinner()
-                val pinningTm = PinningTrustManager(pinner, systemTm)
-                val sslContext = SSLContext.getInstance("TLS")
-                sslContext.init(null, arrayOf<TrustManager>(pinningTm), null)
-                httpsURLConnection.sslSocketFactory = sslContext.socketFactory
-            }
+                ?: throw IllegalStateException(
+                    "Unable to obtain the system X509TrustManager; refusing to proceed " +
+                        "without certificate pinning (#592)."
+                )
+            val pinner = CertificatePinner()
+            val pinningTm = PinningTrustManager(pinner, systemTm)
+            val sslContext = SSLContext.getInstance("TLS")
+            sslContext.init(null, arrayOf<TrustManager>(pinningTm), null)
+            httpsURLConnection.sslSocketFactory = sslContext.socketFactory
         }
     },
     private val retryPolicy: RetryPolicy = RetryPolicy.networkDefault,
@@ -139,7 +141,6 @@ class ApiClient(
         require(VaultDeepLinkParser.isValidVaultId(id)) { "Invalid vault ID" }
         return encodeURLPathPart(id)
     }
-=======
 
     // Auth
     suspend fun getChallenge(): ApiResult<AuthChallenge> = get("/auth/challenge")
@@ -175,10 +176,13 @@ class ApiClient(
         // #599: shared/api-contract.md §Pagination defines limit as 1..100; clamp rather
         // than send a value the server must reject or silently reinterpret.
         val clampedLimit = limit.coerceIn(1, 100)
-        val path = buildString {
-            append("/vaults?limit=$clampedLimit")
-            if (after != null) append("&after=${encodeURLPathPart(after)}")
-        }
+        // Cursors are opaque server-issued strings, so they must be percent-encoded:
+        // a raw cursor containing '&', '+', '=' or '#' would otherwise alter the query
+        // and silently skip or repeat results on the next page.
+        val path = URLBuilder("/vaults").apply {
+            parameters.append("limit", clampedLimit.toString())
+            if (after != null) parameters.append("after", after)
+        }.buildString()
         return get(path)
     }
     suspend fun getVault(id: String): ApiResult<Vault> = get("/vaults/${vaultPathSegment(id)}")

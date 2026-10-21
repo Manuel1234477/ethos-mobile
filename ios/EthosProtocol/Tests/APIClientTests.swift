@@ -589,3 +589,79 @@ final class APIClientPaginationLimitTests: XCTestCase {
         }
     }
 }
+
+// MARK: - #604 listAllVaults Pagination Guard Tests
+
+final class APIClientListAllVaultsPaginationTests: XCTestCase {
+
+    var client: APIClient!
+    let vaultsURL = "https://api.ethos-protocol.app/v1/vaults"
+
+    override func setUpWithError() throws {
+        super.setUp()
+        MockURLProtocol.reset()
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockURLProtocol.self]
+        let session = URLSession(configuration: config)
+        client = APIClient.makeTestInstance(session: session)
+    }
+
+    override func tearDownWithError() throws {
+        MockURLProtocol.reset()
+        super.tearDown()
+    }
+
+    private func vaultJSON(id: String) -> String {
+        """
+        {"id": "\(id)", "owner": "GABC", "beneficiary": "GXYZ", "balance": 100000000, "check_in_interval": 2592000, "last_check_in": "2026-01-01T00:00:00Z", "ttl_remaining": 1000000, "status": "active"}
+        """
+    }
+
+    private func mockPage(url: String, vaultID: String, nextCursor: String?) {
+        let cursorField = nextCursor.map { "\"next_cursor\": \"\($0)\"" } ?? "\"next_cursor\": null"
+        let body = """
+        {"vaults": [\(vaultJSON(id: vaultID))], \(cursorField)}
+        """.data(using: .utf8)!
+        let response = HTTPURLResponse(url: URL(string: url)!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+        MockURLProtocol.mockResponses[url] = (data: body, response: response)
+    }
+
+    // A server that keeps returning the same next_cursor must not loop forever.
+    func test_listAllVaults_repeatedCursor_throwsInsteadOfHanging() async throws {
+        let firstURL = "\(vaultsURL)?limit=\(APIClient.defaultVaultPageSize)"
+        let repeatedURL = "\(vaultsURL)?limit=\(APIClient.defaultVaultPageSize)&cursor=stuck-cursor"
+
+        mockPage(url: firstURL, vaultID: "vault-1", nextCursor: "stuck-cursor")
+        mockPage(url: repeatedURL, vaultID: "vault-2", nextCursor: "stuck-cursor")
+
+        do {
+            _ = try await client.listAllVaults()
+            XCTFail("Expected listAllVaults to throw when the server repeats a cursor")
+        } catch APIError.serverError(let message) {
+            XCTAssertFalse(message.isEmpty, "Pagination guard error should carry a user-showable message")
+        }
+    }
+
+    // A server that never stops paginating must be capped rather than growing `all` without limit.
+    func test_listAllVaults_exceedsPageCap_throwsPaginationError() async throws {
+        // Mock more pages than the cap allows; each page points at a fresh, unique cursor.
+        let pageCount = APIClient.maxVaultPages + 5
+        for index in 0..<pageCount {
+            let url: String
+            if index == 0 {
+                url = "\(vaultsURL)?limit=\(APIClient.defaultVaultPageSize)"
+            } else {
+                url = "\(vaultsURL)?limit=\(APIClient.defaultVaultPageSize)&cursor=cursor-\(index)"
+            }
+            mockPage(url: url, vaultID: "vault-\(index)", nextCursor: "cursor-\(index + 1)")
+        }
+
+        do {
+            _ = try await client.listAllVaults()
+            XCTFail("Expected listAllVaults to throw once the page cap is exceeded")
+        } catch APIError.serverError(let message) {
+            XCTAssertFalse(message.isEmpty, "Pagination cap error should carry a user-showable message")
+        }
+    }
+}

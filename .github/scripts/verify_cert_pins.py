@@ -36,6 +36,7 @@ Exit codes:
 
 import argparse
 import base64
+import json
 import re
 import sys
 from datetime import datetime, timedelta, timezone
@@ -87,6 +88,36 @@ def source_default_pins(path):
     if not match:
         return []
     return [pin.strip() for pin in QUOTED.findall(match.group(1)) if pin.strip()]
+
+
+def shared_pins(path):
+    """Returns the canonical pin set from shared/cert-pins.json, or None when absent.
+
+    The file is the single source of truth both platform inputs are generated from:
+    `{"pins": ["<base64 sha-256 spki>", ...]}`.
+    """
+    raw = read(path)
+    if not raw.strip():
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError("shared pin file {} is not valid JSON: {}".format(path, exc))
+    if not isinstance(data, dict):
+        raise ValueError("shared pin file {} must be a JSON object".format(path))
+    pins = data.get("pins")
+    if not isinstance(pins, list):
+        raise ValueError(
+            "shared pin file {} must contain a 'pins' array".format(path))
+    result = []
+    for pin in pins:
+        if not isinstance(pin, str):
+            raise ValueError(
+                "shared pin file {} contains a non-string pin: {!r}".format(path, pin))
+        stripped = pin.strip()
+        if stripped:
+            result.append(stripped)
+    return result
 
 
 def placeholder_reason(pin):
@@ -165,7 +196,8 @@ def check_certificate_expiry(certificate_expiry, warning_days=60, fail_days=14):
 
 
 def verify(build_type, build_config, source, warn_if_unconfigured=False,
-           certificate_expiry=None, expiry_warning_days=60, expiry_fail_days=14):
+           certificate_expiry=None, expiry_warning_days=60, expiry_fail_days=14,
+           shared_pins_file=None):
     if build_type != "release":
         print("Build type '{}' is not gated — pinning may legitimately be "
               "disabled outside release builds.".format(build_type))
@@ -177,6 +209,14 @@ def verify(build_type, build_config, source, warn_if_unconfigured=False,
     if not configured:
         pins = source_default_pins(source)
         origin = "CertificatePinner compiled-in pins"
+
+    canonical = None
+    if shared_pins_file:
+        try:
+            canonical = shared_pins(shared_pins_file)
+        except ValueError as exc:
+            error(str(exc))
+            return 1
 
     # An explicitly configured pin set is always gated hard. Only the "nothing configured
     # anywhere" case can be downgraded, and only when the caller states this release build
@@ -198,6 +238,22 @@ def verify(build_type, build_config, source, warn_if_unconfigured=False,
         if reason:
             problems.append(
                 "Release certificate pin '{}' (from {}) {}.".format(pin, origin, reason)
+            )
+
+    # The generated platform inputs must match the single-source pin set exactly.
+    if canonical is not None and pins:
+        if set(pins) != set(canonical):
+            missing = sorted(set(canonical) - set(pins))
+            extra = sorted(set(pins) - set(canonical))
+            detail = []
+            if missing:
+                detail.append("missing from {}: {}".format(origin, ", ".join(missing)))
+            if extra:
+                detail.append("not in {}: {}".format(shared_pins_file, ", ".join(extra)))
+            problems.append(
+                "Generated certificate pins ({}) do not match the canonical pin set in "
+                "{} ({}). Regenerate the platform inputs from the shared file.".format(
+                    origin, shared_pins_file, "; ".join(detail))
             )
 
     if problems:
@@ -225,6 +281,9 @@ def main(argv=None):
                         help="Path to the generated BuildConfig.java for that build type.")
     parser.add_argument("--source", required=True,
                         help="Path to CertificatePinning.kt (source of the compiled-in pins).")
+    parser.add_argument("--shared-pins", default=None,
+                        help="Path to shared/cert-pins.json, the canonical pin set the "
+                             "generated platform inputs must match.")
     parser.add_argument("--warn-if-unconfigured", action="store_true",
                         help="Report (rather than fail on) placeholder pins when no pin set "
                              "was configured at all — for release builds that cannot ship.")
@@ -244,6 +303,7 @@ def main(argv=None):
         certificate_expiry=args.certificate_expiry,
         expiry_warning_days=args.expiry_warning_days,
         expiry_fail_days=args.expiry_fail_days,
+        shared_pins_file=args.shared_pins,
     )
 
 

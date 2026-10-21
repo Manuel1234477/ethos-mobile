@@ -223,13 +223,34 @@ public final class APIClient {
         (value?.isEmpty ?? true) ? nil : value
     }
 
+    /// Upper bound on the number of pages listAllVaults() will fetch before giving
+    /// up. Guards against a server that never stops returning a next cursor (or a
+    /// pathologically large account) growing `all` without limit.
+    static let maxVaultPages = 100
+
     /// Fetches every page and concatenates the results, for callers (background
     /// refresh, the TTL widget) that need the complete vault set to compute
     /// accurate TTL warnings rather than a single page at a time.
+    ///
+    /// Guards against non-advancing cursors and unbounded pagination (#604): if the
+    /// server repeats a cursor we've already followed, or we exceed `maxVaultPages`,
+    /// we throw instead of looping forever. The error surfaces through
+    /// `errorDescription`/`recoverySuggestion` so the UI can present it.
     public func listAllVaults() async throws -> [Vault] {
         var all: [Vault] = []
         var cursor: String?
+        var seenCursors = Set<String>()
+        var pageCount = 0
         repeat {
+            if let cursor {
+                guard seenCursors.insert(cursor).inserted else {
+                    throw APIError.serverError("Pagination did not advance; please try again")
+                }
+            }
+            guard pageCount < Self.maxVaultPages else {
+                throw APIError.serverError("Too many vaults to load at once; please try again")
+            }
+            pageCount += 1
             let page = try await listVaults(cursor: cursor)
             all.append(contentsOf: page.vaults)
             cursor = page.nextCursor
