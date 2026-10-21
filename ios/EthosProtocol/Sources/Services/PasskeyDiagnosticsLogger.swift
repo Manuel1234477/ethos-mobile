@@ -14,10 +14,17 @@ final class PasskeyDiagnosticsLogger {
     private var eventLog: [PasskeyDiagnosticsEntry] = []
     private let queue = DispatchQueue(label: "com.ethos-protocol.passkey-diagnostics-logger", attributes: .concurrent)
 
+    /// Maximum number of entries retained in memory, mirroring NotificationDeliveryLog's
+    /// bounded-log pattern on Android.
+    static let maxEntries = 100
+
     /// Logs a registration failure. `attestationFormat` is the WebAuthn `fmt` value
     /// (e.g. "packed", "none") when it could be parsed from the attestation object, or
     /// `nil` when the ceremony failed before one was produced.
+    ///
+    /// Diagnostic logging is restricted to debug builds; in release builds this is a no-op.
     func logRegistrationFailure(authenticatorAttachment: String, attestationFormat: String?, reason: String) {
+        #if DEBUG
         let entry = PasskeyDiagnosticsEntry(
             authenticatorAttachment: authenticatorAttachment,
             attestationFormat: attestationFormat,
@@ -26,7 +33,11 @@ final class PasskeyDiagnosticsLogger {
         )
         queue.async(flags: .barrier) {
             self.eventLog.append(entry)
+            if self.eventLog.count > Self.maxEntries {
+                self.eventLog.removeFirst(self.eventLog.count - Self.maxEntries)
+            }
         }
+        #endif
     }
 
     /// Retrieves all logged events

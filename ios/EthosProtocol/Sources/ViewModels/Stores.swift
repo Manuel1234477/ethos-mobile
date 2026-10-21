@@ -38,7 +38,12 @@ final class AuthStore: ObservableObject {
     // ASAuthorizationController-driven ceremonies can't run in a unit test, so AuthStore's
     // own orchestration (single ceremony on register, proactive refresh scheduling,
     // delete-and-reauth fallback) is exercised against these instead.
-    var passkeyRegister: (String) async throws -> AuthToken = { try await PasskeyService.shared.register(username: $0) }
+    // Registration now also yields the server-issued opaque WebAuthn user handle
+    // (#624). It is persisted so the same handle is reused for every subsequent
+    // ceremony on this account, rather than one derived from the username.
+    var passkeyRegister: (String) async throws -> PasskeyRegistrationResult = {
+        try await PasskeyService.shared.register(username: $0)
+    }
     var passkeyAuthenticate: () async throws -> AuthToken = { try await PasskeyService.shared.authenticate() }
     var refreshToken: () async throws -> AuthToken = { try await APIClient.shared.refreshToken() }
     var linkAdditionalPasskey: (String, AccountRecoveryProof) async throws -> String = { username, proof in
@@ -78,7 +83,11 @@ final class AuthStore: ObservableObject {
     func register(username: String) async {
         isLoading = true; error = nil
         do {
-            let token = try await passkeyRegister(username)
+            let result = try await passkeyRegister(username)
+            // Persist the opaque user handle before anything else so it survives a
+            // crash between registration and the first authenticated request.
+            KeychainService.shared.saveUserHandle(result.userHandle)
+            let token = result.token
             KeychainService.shared.saveToken(token.token, expiresAt: token.expiresAt)
             ifNotCancelled {
                 isAuthenticated = true
@@ -128,6 +137,9 @@ final class AuthStore: ObservableObject {
         // this account — a subsequent user signing in on the same device must not inherit
         // them.
         KeychainService.shared.deleteCredentialID()
+        // The opaque WebAuthn user handle (#624) is account-scoped too — clear it so a
+        // subsequent user on this device never reuses the previous account's handle.
+        KeychainService.shared.deleteUserHandle()
         ICloudSyncService.shared.clearLocalAssociations()
         // Ties into #10: a subsequent user signing in on the same device must never be served
         // the previous user's cached vault data while offline.
@@ -337,14 +349,26 @@ final class VaultStore: ObservableObject {
 
     /// Filtered and sorted vaults based on search text, status filter, and sort option
     var filteredAndSortedVaults: [Vault] {
-        vaults
+        // Issue #474: vaults merged away into another vault are hidden from
+        // the main list — they still exist and VaultMergeStore can un-merge
+        // them, but they no longer clutter the primary view.
+        let hidden = VaultMergeStore.hiddenVaultIds()
+        return vaults
             .filter { vault in
+                !hidden.contains(vault.id) &&
                 statusFilter.matches(vault: vault) &&
                 (searchText.isEmpty || vault.id.lowercased().contains(searchText.lowercased()))
             }
             .sorted { lhs, rhs in
                 sortOption.compare(lhs: lhs, rhs: rhs)
             }
+    }
+
+    /// Issue #474: duplicate-vault groups (same beneficiary, different vault
+    /// IDs), excluding any pair where one side has already been merged away.
+    var duplicateGroups: [VaultDuplicateGroup] {
+        let hidden = VaultMergeStore.hiddenVaultIds()
+        return VaultDuplicateDetector.findDuplicateGroups(in: vaults.filter { !hidden.contains($0.id) })
     }
 
     init() {
@@ -475,7 +499,17 @@ final class VaultStore: ObservableObject {
             // returns, mirroring Android's VaultViewModel.checkIn → PendingCheckInDao
             // + CheckInSyncWorker pattern.
             let item = PendingCheckIn(vaultId: vault.id, queuedAt: Date(), idempotencyKey: idempotencyKey)
-            PendingCheckInStore.shared.insert(item)
+            do {
+                // A check-in is the most time-sensitive action the app queues, so a failed
+                // write must not be swallowed (#615): surface it as a blocking alert rather
+                // than letting the user believe the check-in is safely queued.
+                try PendingCheckInStore.shared.insert(item)
+            } catch {
+                ifNotCancelled {
+                    self.error = ErrorPresentation(message: "Offline — your check-in could not be saved and was not queued. Please try again.")
+                }
+                return
+            }
             let count = PendingCheckInStore.shared.count
             NotificationService.shared.showQueuedCheckIn(count: count)
             CheckInSyncTask.shared.scheduleSync()

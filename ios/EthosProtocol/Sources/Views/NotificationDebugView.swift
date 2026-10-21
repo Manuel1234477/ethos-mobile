@@ -8,9 +8,41 @@ import SwiftUI
 /// NotificationDeliveryLog's doc comment for what is deliberately excluded.
 struct NotificationDebugView: View {
     @State private var events: [NotificationDeliveryEvent] = []
+    @State private var stats: [NotificationDeliveryLog.EngagementStats] = []
 
     var body: some View {
         List {
+            // Issue #473: engagement analytics dashboard — tap rate and
+            // completion rate per notification type, from the same bounded
+            // local log the event list below already reads.
+            if !stats.isEmpty {
+                Section("Engagement") {
+                    ForEach(stats, id: \.eventType) { stat in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(stat.eventType)
+                                .font(.subheadline.bold())
+                            HStack {
+                                Text("Delivered: \(stat.delivered)")
+                                Spacer()
+                                Text("Tapped: \(stat.tapped)")
+                                Spacer()
+                                Text("Dismissed: \(stat.dismissed)")
+                            }
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            HStack {
+                                Text("Tap rate: \(Int(stat.tapRate * 100))%")
+                                Spacer()
+                                Text("Completion rate: \(Int(stat.completionRate * 100))%")
+                            }
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
+            }
+
             if events.isEmpty {
                 Text("No notification events logged yet.")
                     .foregroundStyle(.secondary)
@@ -45,11 +77,17 @@ struct NotificationDebugView: View {
                 Button("Clear") {
                     NotificationDeliveryLog.shared.clear()
                     events = []
+                    stats = []
                 }
             }
         }
-        .task { events = NotificationDeliveryLog.shared.recentEvents() }
-        .refreshable { events = NotificationDeliveryLog.shared.recentEvents() }
+        .task { reload() }
+        .refreshable { reload() }
+    }
+
+    private func reload() {
+        events = NotificationDeliveryLog.shared.recentEvents()
+        stats = NotificationDeliveryLog.shared.engagementStats()
     }
 
     private func color(for kind: NotificationDeliveryEvent.Kind) -> Color {
@@ -57,6 +95,9 @@ struct NotificationDebugView: View {
         case .scheduled: return .blue
         case .delivered: return .green
         case .suppressed: return .orange
+        case .tapped: return .purple
+        case .dismissed: return .gray
+        case .completed: return .mint
         }
     }
 }

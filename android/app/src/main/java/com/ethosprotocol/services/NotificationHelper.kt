@@ -74,6 +74,11 @@ class NotificationHelper @Inject constructor(
         return id
     }
 
+    // FLAG_UPDATE_CURRENT reuses a PendingIntent whenever the request code matches, so a shared
+    // code would make grouped notifications open whichever vault's extras were written last.
+    // Keying the request code on the vault keeps each vault's tap target distinct.
+    internal fun pendingIntentRequestCodeFor(vaultId: String?): Int = notificationIdFor(vaultId)
+
     /**
      * Badge count for pending check-ins. Used by the in-app notification badge so users
      * can see at a glance how many check-ins are still awaiting action.
@@ -105,7 +110,7 @@ class NotificationHelper @Inject constructor(
                 flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
                 vaultId?.let { data = android.net.Uri.parse("ethosprotocol://vault/$it/check-in") }
             }
-            val pi = PendingIntent.getActivity(context, 0, intent,
+            val pi = PendingIntent.getActivity(context, pendingIntentRequestCodeFor(vaultId), intent,
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
 
             val groupKey = vaultId ?: "general"

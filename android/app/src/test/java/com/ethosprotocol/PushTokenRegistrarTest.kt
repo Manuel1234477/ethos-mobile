@@ -66,6 +66,80 @@ class PushTokenRegistrarTest {
     }
 
     @Test
+    fun `registerSuspending does not retry a 400 and clears pending token`() = runTest {
+        val tokenProvider = FakeTokenProvider()
+        tokenProvider.pendingPushToken = "stale-token"
+        val registrar = PushTokenRegistrar(apiClient = mockk(), tokenProvider = tokenProvider)
+        registrar.retryPolicy = fastPolicy(maxAttempts = 3)
+        var attempts = 0
+        registrar.registerCall = { _ ->
+            attempts++
+            ApiResult.Error("bad request", 400)
+        }
+
+        registrar.registerSuspending("token-400")
+
+        assertEquals("a 400 must not be retried", 1, attempts)
+        assertNull("rejected token must not be marked registered", tokenProvider.pushToken)
+        assertNull("rejected token must not stay pending", tokenProvider.pendingPushToken)
+    }
+
+    @Test
+    fun `registerSuspending does not retry a 401 and clears pending token`() = runTest {
+        val tokenProvider = FakeTokenProvider()
+        tokenProvider.pendingPushToken = "stale-token"
+        val registrar = PushTokenRegistrar(apiClient = mockk(), tokenProvider = tokenProvider)
+        registrar.retryPolicy = fastPolicy(maxAttempts = 3)
+        var attempts = 0
+        registrar.registerCall = { _ ->
+            attempts++
+            ApiResult.Error("unauthorized", 401)
+        }
+
+        registrar.registerSuspending("token-401")
+
+        assertEquals("a 401 must not be retried", 1, attempts)
+        assertNull("rejected token must not be marked registered", tokenProvider.pushToken)
+        assertNull("rejected token must not stay pending", tokenProvider.pendingPushToken)
+    }
+
+    @Test
+    fun `registerSuspending retries 500 up to maxAttempts and leaves pending token on exhaustion`() = runTest {
+        val tokenProvider = FakeTokenProvider()
+        val registrar = PushTokenRegistrar(apiClient = mockk(), tokenProvider = tokenProvider)
+        registrar.retryPolicy = fastPolicy(maxAttempts = 3)
+        var attempts = 0
+        registrar.registerCall = { _ ->
+            attempts++
+            ApiResult.Error("server error", 500)
+        }
+
+        registrar.registerSuspending("token-500")
+
+        assertEquals("a 500 should be retried up to maxAttempts", 3, attempts)
+        assertNull("should not be marked registered on failure", tokenProvider.pushToken)
+        assertEquals("token-500", tokenProvider.pendingPushToken)
+    }
+
+    @Test
+    fun `registerSuspending retries NetworkUnavailable up to maxAttempts and leaves pending token on exhaustion`() = runTest {
+        val tokenProvider = FakeTokenProvider()
+        val registrar = PushTokenRegistrar(apiClient = mockk(), tokenProvider = tokenProvider)
+        registrar.retryPolicy = fastPolicy(maxAttempts = 3)
+        var attempts = 0
+        registrar.registerCall = { _ ->
+            attempts++
+            ApiResult.NetworkUnavailable
+        }
+
+        registrar.registerSuspending("token-net")
+
+        assertEquals("a network error should be retried up to maxAttempts", 3, attempts)
+        assertNull("should not be marked registered on failure", tokenProvider.pushToken)
+        assertEquals("token-net", tokenProvider.pendingPushToken)
+    }
+
+    @Test
     fun `retryPendingIfNeeded does nothing when no token is pending`() = runTest {
         val tokenProvider = FakeTokenProvider()
         val registrar = PushTokenRegistrar(apiClient = mockk(), tokenProvider = tokenProvider)

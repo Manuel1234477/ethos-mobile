@@ -38,22 +38,24 @@ jobs:
   # scanning happening without blocking unrelated PRs.
   dependency-check:
     runs-on: ubuntu-latest
+    # Caps the run so a stalled NVD sync cannot hang the job for hours (see #178).
+    timeout-minutes: 45
     # The "Alert on failure" step files a GitHub issue on scheduled-run
     # failures, which needs issues:write — the default GITHUB_TOKEN is
     # read-only, so without this the alert itself fails with a 403.
     permissions:
       issues: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "17"
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
@@ -67,7 +69,7 @@ jobs:
       # fetch the incremental delta. Keyed by week so the cache still refreshes
       # regularly rather than growing stale indefinitely.
       - name: Cache OWASP dependency-check database
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: android/dependency-check-data
           key: dependency-check-data-${{ steps.date.outputs.week }}
@@ -82,6 +84,9 @@ jobs:
       # failure — anything else (a real CVSS >= 7.0 finding, or any other error)
       # still fails the job.
       - name: Scan dependencies for high severity vulnerabilities
+        env:
+          # Optional: with a key the NVD feed is not rate-limited (HTTP 429).
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
         run: |
           set +e
           ./gradlew dependencyCheckAggregate 2>&1 | tee dependency-check-output.log
@@ -99,25 +104,58 @@ jobs:
 
           exit "$STATUS"
 
+      # Keeps the scan output as a run artifact, so the cause of a failed scheduled run
+      # can be read without opening the log. Refs #557, #558.
+      - name: Keep dependency-check output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-output
+          path: android/dependency-check-output.log
+          if-no-files-found: ignore
+          retention-days: 30
+
       - name: Alert on failure (scheduled run)
         if: failure() && github.event_name == 'schedule'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
-            await github.rest.issues.create({
+            const title = "⚠️ Android dependency-check failed (scheduled scan)";
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            // Repeated failures add a comment to the open alert instead of a new duplicate issue.
+            const open = await github.paginate(github.rest.issues.listForRepo, {
               owner: context.repo.owner,
-              repo:  context.repo.repo,
-              title: "⚠️ Android dependency-check failed (scheduled scan)",
-              body: [
-                "The weekly Android dependency vulnerability scan failed.",
-                "",
-                "This may mean a dependency now has a known CVSS >= 7.0 vulnerability, or the",
-                "scan itself failed for an unrelated reason (see the run log).",
-                "",
-                `Workflow run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-                "",
-                "Related: #178 (moved this job off the per-PR trigger after it repeatedly",
-                "hung for 1h+ without an NVD API key and got killed by the runner)."
-              ].join("\n"),
-              labels: ["security", "android", "ci"]
+              repo: context.repo.repo,
+              state: "open",
+              labels: "security,android,ci",
             });
+            const existing = open.find((issue) => issue.title === title);
+
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body: `Scheduled scan failed again: ${runUrl}`,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                title,
+                body: [
+                  "The weekly Android dependency vulnerability scan failed.",
+                  "",
+                  "This may mean a dependency now has a known CVSS >= 7.0 vulnerability, or the",
+                  "scan itself failed for an unrelated reason (see the run log).",
+                  "",
+                  `Workflow run: ${runUrl}`,
+                  "",
+                  "Related: #178 (moved this job off the per-PR trigger after it repeatedly",
+                  "hung for 1h+ without an NVD API key and got killed by the runner)."
+                ].join("
+"),
+                labels: ["security", "android", "ci"]
+              });
+            }

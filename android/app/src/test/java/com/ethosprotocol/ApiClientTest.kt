@@ -22,6 +22,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import javax.crypto.Mac
@@ -173,6 +174,35 @@ class ApiClientTest {
         verify { tokenProvider.clear() }
     }
 
+    // #596: cursors are opaque server-issued strings; reserved characters must be
+    // percent-encoded so the next page isn't silently skipped or repeated.
+    @Test
+    fun `listVaults percent-encodes a cursor containing reserved characters`() = runTest {
+        every { tokenProvider.token } returns "good-token"
+        every { tokenProvider.isNearExpiry() } returns false
+
+        val cursor = "a&b+c=d#e"
+        var capturedUrl: io.ktor.http.Url? = null
+        val engine = MockEngine { request ->
+            capturedUrl = request.url
+            respond(
+                content = "[]",
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, "application/json")
+            )
+        }
+        val apiClient = ApiClient(tokenProvider, networkMonitor, offlineCache, "https://test", engine)
+
+        apiClient.listVaults(limit = 10, after = cursor)
+
+        val url = requireNotNull(capturedUrl)
+        // The raw query must not contain the unencoded reserved characters.
+        assertFalse(url.encodedQuery.contains("after=$cursor"))
+        // After decoding, the cursor must round-trip unchanged.
+        assertEquals(cursor, url.parameters["after"])
+        assertEquals("10", url.parameters["limit"])
+    }
+
     @Test
     fun `401 with no body falls back to a generic Unauthorized message`() = runTest {
         every { tokenProvider.token } returns null
@@ -318,5 +348,16 @@ class ApiClientTest {
     private fun sha256Hex(data: String): String {
         val digest = java.security.MessageDigest.getInstance("SHA-256")
         return digest.digest(data.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+    }
+
+    // #592: pinning must fail closed. If the platform TrustManager cannot be obtained,
+    // engine construction must throw rather than silently running without pinning.
+    @Test
+    fun `null system TrustManager fails closed instead of skipping pinning`() {
+        val failure = assertThrows(IllegalStateException::class.java) {
+            ApiClient.sslManager(systemTm = null)
+        }
+
+        assertTrue(failure.message.orEmpty().contains("TrustManager"))
     }
 }

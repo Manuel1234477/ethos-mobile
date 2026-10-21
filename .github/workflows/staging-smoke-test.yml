@@ -19,12 +19,16 @@ on:
   workflow_call:
   workflow_dispatch:
 
+# Read-only by default. A job that needs more scope must say so itself.
+permissions:
+  contents: read
+
 jobs:
   smoke-test:
     name: Smoke test staging (auth, list vaults, check-in)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Run staging smoke tests
         env:

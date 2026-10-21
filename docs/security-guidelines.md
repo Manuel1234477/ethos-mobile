@@ -595,8 +595,8 @@ are not a disclosure list — if you find something new, report it per
 | iOS PIN storage | Plain unsalted SHA-256, no attempt limiting | §2.4 |
 | Clipboard | `SensitiveClipboard` exists but several copy paths bypass it | §2.5 |
 | iOS Keychain | Access group declared in entitlements but not set on `SecItem` calls, so widget reads may fail | §2.3 |
-| Android pinning | Fails open if the system trust manager cannot be obtained | §5.1 |
-| `X-Request-Signature` | Not in the shared contract; Android-only | §3.5 |
+| Nonce generation | iOS uses `UInt8.random`; the contract mandates `CryptoKit.SymmetricKey` | §3.3 |
+| `X-Request-Signature` | Not in the shared contract; Android-only; signs too little and keys with the bearer token | §3.5 |
 | `user.id` | Derived from the username on both platforms rather than an opaque handle | §3.1 |
 | Request signature / redaction | Redaction list is hand-maintained and does not cover every contract header | §4.1 |
 | Room database | `pending_actions.db` stores vault IDs and amounts unencrypted | §2.2 |

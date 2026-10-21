@@ -43,6 +43,14 @@ class NotificationHelperTest {
     }
 
     @Test
+    fun `two vaults produce distinct PendingIntent request codes`() {
+        val first = helper.pendingIntentRequestCodeFor("vault-1")
+        val second = helper.pendingIntentRequestCodeFor("vault-2")
+
+        assertNotEquals(first, second)
+    }
+
+    @Test
     fun `vault notification ids never collide with the queued check-in id`() {
         val ids = (0 until 100).map { helper.notificationIdFor("vault-$it") }
 

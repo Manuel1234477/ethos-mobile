@@ -25,6 +25,99 @@ final class KeychainServiceHostedTests: XCTestCase {
         XCTAssertEqual(KeychainService.shared.loadToken(), token)
         KeychainService.shared.deleteToken()
     }
+
+    // MARK: - #621 Constant-Time PIN Verification
+
+    func test_verifyPIN_returnsTrueForCorrectPIN() throws {
+        let pin = "482913"
+        try KeychainService.shared.savePIN(pin)
+        defer { KeychainService.shared.deletePIN() }
+
+        XCTAssertTrue(KeychainService.shared.verifyPIN(pin),
+                      "verifyPIN should accept the PIN that was stored")
+    }
+
+    func test_verifyPIN_returnsFalseForIncorrectPIN() throws {
+        let pin = "482913"
+        try KeychainService.shared.savePIN(pin)
+        defer { KeychainService.shared.deletePIN() }
+
+        XCTAssertFalse(KeychainService.shared.verifyPIN("000000"),
+                       "verifyPIN should reject a PIN that does not match")
+        XCTAssertFalse(KeychainService.shared.verifyPIN("482914"),
+                       "verifyPIN should reject a PIN differing in the last digit")
+        XCTAssertFalse(KeychainService.shared.verifyPIN(""),
+                       "verifyPIN should reject an empty PIN")
+    }
+
+    // MARK: - #622 Shared Keychain Access Group
+
+    func test_saveToken_isReadableThroughSharedAccessGroup() throws {
+        // The widget reads the token through the shared keychain-access-group
+        // declared in EthosProtocol.entitlements / TTLWidget.entitlements.
+        // Writing via the app and reading back through an explicit query that
+        // sets kSecAttrAccessGroup proves the item lands in the shared group
+        // rather than the app's default group.
+        let token = "shared-group-token-\(UUID().uuidString)"
+        KeychainService.shared.saveToken(token)
+        defer { KeychainService.shared.deleteToken() }
+
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: KeychainService.service,
+            kSecAttrAccount as String: KeychainService.tokenAccount,
+            kSecAttrAccessGroup as String: KeychainService.accessGroup,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        XCTAssertEqual(status, errSecSuccess,
+                       "Item written by the app must be readable through the shared access group (status \(status))")
+
+        let data = try XCTUnwrap(result as? Data)
+        XCTAssertEqual(String(data: data, encoding: .utf8), token)
+    }
+
+    // MARK: - #623 Update/Add Keychain Writes and Status Surfacing
+
+    func test_saveToken_returnsSuccessOnAddPath() throws {
+        KeychainService.shared.deleteToken()
+        let status = KeychainService.shared.saveToken("add-path-token")
+        defer { KeychainService.shared.deleteToken() }
+
+        XCTAssertEqual(status, errSecSuccess, "Saving a new token should succeed via SecItemAdd")
+        XCTAssertEqual(KeychainService.shared.loadToken(), "add-path-token")
+    }
+
+    func test_saveToken_returnsSuccessOnUpdatePath() throws {
+        KeychainService.shared.saveToken("initial-token")
+        defer { KeychainService.shared.deleteToken() }
+
+        let status = KeychainService.shared.saveToken("updated-token")
+
+        XCTAssertEqual(status, errSecSuccess, "Overwriting an existing token should succeed via SecItemUpdate")
+        XCTAssertEqual(KeychainService.shared.loadToken(), "updated-token",
+                       "The update path must not drop the token")
+    }
+
+    func test_saveToken_surfacesFailureStatusAndPreservesExistingToken() throws {
+        // Force a failure by making the item unreadable/unwritable is not portable,
+        // so instead assert the contract: a non-success status is returned to the
+        // caller rather than swallowed, and the previously stored token survives.
+        KeychainService.shared.saveToken("surviving-token")
+        defer { KeychainService.shared.deleteToken() }
+
+        // A save with an empty account/key is rejected by the service and must
+        // report a non-success OSStatus instead of silently dropping the token.
+        let status = KeychainService.shared.saveToken("", account: "")
+
+        XCTAssertNotEqual(status, errSecSuccess,
+                          "A failed save must surface a non-errSecSuccess OSStatus to the caller")
+        XCTAssertEqual(KeychainService.shared.loadToken(), "surviving-token",
+                       "A failed save must not delete the previously stored token")
+    }
 }
 
 // MARK: - #24 Sign-Out Push Token Unregistration Tests with Real Host

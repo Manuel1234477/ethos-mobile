@@ -42,7 +42,7 @@ When you discover a flaky test:
 
 1. Apply the `@Ignore` annotation with the issue reference:
    ```kotlin
-   @Ignore("Flaky: #XXX — [description of flakiness]")
+   @Ignore("Flaky: <tracking issue> — [description of flakiness]")
    @Test
    fun testName() { ... }
    ```

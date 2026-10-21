@@ -2,6 +2,7 @@ package com.ethosprotocol
 
 import com.ethosprotocol.services.SensitiveClipboard
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -47,5 +48,36 @@ class SensitiveClipboardTest {
             60L,
             SensitiveClipboard.CLEAR_DELAY_SECONDS
         )
+    }
+
+    @Test
+    fun `shouldClear preserves a clip copied after the sensitive value`() {
+        assertFalse(
+            "Auto-clear must not delete a clip the user copied during the window",
+            SensitiveClipboard.shouldClear(currentClip = "other text", copiedValue = "secret")
+        )
+    }
+
+    @Test
+    fun `shouldClear clears when the clipboard still holds the sensitive value`() {
+        assertTrue(
+            SensitiveClipboard.shouldClear(currentClip = "secret", copiedValue = "secret")
+        )
+    }
+
+    @Test
+    fun `shouldClear preserves an empty clipboard`() {
+        assertFalse(SensitiveClipboard.shouldClear(currentClip = null, copiedValue = "secret"))
+    }
+
+    @Test
+    fun `shouldMarkSensitive is false below Android 13`() {
+        assertFalse(SensitiveClipboard.shouldMarkSensitive(32))
+    }
+
+    @Test
+    fun `shouldMarkSensitive is true from Android 13 (API 33)`() {
+        assertTrue(SensitiveClipboard.shouldMarkSensitive(33))
+        assertTrue(SensitiveClipboard.shouldMarkSensitive(35))
     }
 }

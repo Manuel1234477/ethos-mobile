@@ -17,14 +17,34 @@ fun signingProp(envName: String, propName: String): String? =
     System.getenv(envName)?.takeIf { it.isNotBlank() }
         ?: (project.findProperty(propName) as String?)?.takeIf { it.isNotBlank() }
 
-// #173: Certificate pins that will be compiled into a release build. Supplied out of band
-// (CI secret / local gradle.properties) so rotating a pin never needs a source change, and
-// verified before release artifacts ship by .github/scripts/verify_cert_pins.py. When it is
-// blank, CertificatePinner's pin set is empty, which disables pinning (#169) — there is no
-// compiled-in fallback, so an unconfigured build can never pin to an unmatchable value.
+// #593: The certificate pin set is single-sourced in shared/cert-pins.json, which is the
+// source of truth for both Android (this file) and iOS (project.yml -> Info.plist). The
+// shared file is the compiled-in default so rotating a pin only requires editing one place;
+// the CI gate (.github/scripts/check_tls_pinning.py) asserts the generated platform values
+// match it. An out-of-band override (CI secret / local gradle.properties) still wins when
+// set, so a pin can be rotated without a source change in an emergency.
+//
+// When the resolved set is blank, CertificatePinner's pin set is empty, which disables
+// pinning (#169) — there is no compiled-in fallback, so an unconfigured build can never
+// pin to an unmatchable value.
+val sharedCertPinsFile = rootProject.file("../shared/cert-pins.json")
+
+// Minimal JSON read of the shared pin set: the file is a flat object of
+// {"sha256/<base64>": "description", ...} (see shared/cert-pins.json). We avoid pulling in
+// a JSON library at configuration time by extracting the quoted keys with a regex.
+fun readSharedCertPins(): String {
+    if (!sharedCertPinsFile.exists()) return ""
+    val json = sharedCertPinsFile.readText()
+    val pins = Regex("\"([^\"]+)\"\\s*:").findAll(json)
+        .map { it.groupValues[1] }
+        .filter { it.startsWith("sha256/") }
+        .toList()
+    return pins.joinToString(",")
+}
+
 val releaseCertPins = System.getenv("ETHOS_CERT_PINS")?.takeIf { it.isNotBlank() }
     ?: (project.findProperty("ethos.certPins") as String?)?.takeIf { it.isNotBlank() }
-    ?: ""
+    ?: readSharedCertPins()
 
 // #425: Sentry DSN for crash reporting. Supplied out of band (CI secret / local
 // gradle.properties) like the signing credentials above — never hardcoded. When blank,
@@ -69,7 +89,8 @@ android {
         multiDexEnabled = true
         buildConfigField("String", "API_BASE_URL", "\"https://api.ethos-protocol.app/v1\"")
         // Empty by default: an empty pin set disables pinning, which is what debug builds
-        // pointing at a local/dev host want. Only the release build type is gated (#173).
+        // pointing at a local/dev host want. Only the release build type is gated (#173);
+        // the release pin set is single-sourced from shared/cert-pins.json (#593).
         buildConfigField("String", "CERT_PINS", "\"\"")
         // #425: Crash reporting DSN. Empty by default (reporting disabled); the release
         // build type injects the out-of-band value below.
@@ -107,6 +128,17 @@ android {
         unitTests {
             isIncludeAndroidResources = true
         }
+    }
+
+    // #631: Register the custom lint detector (UnguardedVaultIdLog) so it actually runs
+    // during `lint`/`lintDebug`/`lintRelease`. The detector lives in the :lint module and
+    // is wired in via `lintChecks` below; the rule itself is enabled in lint.xml.
+    lint {
+        // Fail the build on the vault-ID logging violation so it can't regress silently.
+        // (Severity is defined by the detector; this just ensures it's treated as an error.)
+        abortOnError = true
+        // Keep the existing lint behavior for everything else intact.
+        checkReleaseBuilds = true
     }
 
     signingConfigs {
@@ -150,9 +182,10 @@ android {
 
             // Staging cert pins: empty → pinning disabled (safe for staging; staging
             // cert is separate from production and may rotate frequently during testing).
+            // Falls back to the shared pin set (#593) so staging is pinned by default too.
             val stagingCertPins = System.getenv("ETHOS_STAGING_CERT_PINS")?.takeIf { it.isNotBlank() }
                 ?: (project.findProperty("ethos.stagingCertPins") as String?)?.takeIf { it.isNotBlank() }
-                ?: ""
+                ?: readSharedCertPins()
             buildConfigField("String", "CERT_PINS", "\"$stagingCertPins\"")
 
             // Distinct application ID so the staging APK can be installed alongside
@@ -182,6 +215,13 @@ android {
             "-opt-in=androidx.compose.material3.ExperimentalMaterial3Api",
         )
     }
+}
+
+dependencies {
+    // #631: Custom lint detector (UnguardedVaultIdLog) that flags unguarded vaultId in
+    // Log.* calls. `lintChecks` makes the detector run as part of this module's lint
+    // tasks without packaging it into the app. The rule is enabled in lint.xml.
+    lintChecks(project(":lint"))
 }
 
 // JUnit pulls in org.hamcrest:hamcrest-core:1.3, which espresso-core (transitively required
@@ -223,5 +263,3 @@ configurations.all {
         //  CVE-2026-48006/48043/48059, CVE-2026-50010/50011/50020/50560,
         //  CVE-2026-55831/55833/55851, CVE-2026-56745/56746/56817/56819-56822,
         //  CVE-2026-59898-59901/5
-
-/* … truncated 6345 chars — edit only what you need near the top … */

@@ -84,8 +84,10 @@ final class PendingActionStore {
     ///
     /// For `.deposit` / `.withdraw`: always appended — each carries a unique `id`, so
     /// two deposits of different amounts for the same vault are independent operations.
-    func insert(_ item: PendingAction) {
-        queue.sync {
+    /// - Throws: The underlying write error if the queue could not be persisted, so
+    ///   callers can surface that the action was not saved and retry later.
+    func insert(_ item: PendingAction) throws {
+        try queue.sync {
             var items = load()
             switch item.type {
             case .checkIn:
@@ -97,22 +99,26 @@ final class PendingActionStore {
                 break
             }
             items.append(item)
-            save(items)
+            try save(items)
         }
     }
 
     /// Remove a successfully-delivered action from the queue.
-    func delete(_ item: PendingAction) {
-        queue.sync {
+    ///
+    /// - Throws: The underlying write error if the queue could not be persisted.
+    func delete(_ item: PendingAction) throws {
+        try queue.sync {
             var items = load()
             items.removeAll { $0.id == item.id }
-            save(items)
+            try save(items)
         }
     }
 
     /// Wipe the entire queue (used in tests and on sign-out).
-    func deleteAll() {
-        queue.sync { save([]) }
+    ///
+    /// - Throws: The underlying write error if the queue could not be persisted.
+    func deleteAll() throws {
+        try queue.sync { try save([]) }
     }
 
     // MARK: - Private helpers
@@ -124,11 +130,21 @@ final class PendingActionStore {
         return (try? decoder.decode([PendingAction].self, from: data)) ?? []
     }
 
-    private func save(_ items: [PendingAction]) {
+    private func save(_ items: [PendingAction]) throws {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = .prettyPrinted
-        guard let data = try? encoder.encode(items) else { return }
-        try? data.write(to: fileURL, options: .atomic)
+        let data = try encoder.encode(items)
+        // The queue holds vault IDs and check-in data, so require the file to be
+        // unreadable while the device is locked. `.completeFileProtection` is the
+        // strictest class; fall back to `.completeFileProtectionUnlessOpen` only
+        // where the platform requires it (e.g. the file must be writable while locked).
+        var options: Data.WritingOptions = [.atomic, .completeFileProtection]
+        do {
+            try data.write(to: fileURL, options: options)
+        } catch let error as NSError where error.domain == NSCocoaErrorDomain {
+            options = [.atomic, .completeFileProtectionUnlessOpen]
+            try data.write(to: fileURL, options: options)
+        }
     }
 }
