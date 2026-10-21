@@ -20,12 +20,17 @@
 #                         (upper-case, colon-delimited bytes, e.g. "AB:CD:...:EF:01:CD:...:23")
 #                         At least one must appear in the file.
 #                         Set to empty string to skip fingerprint verification.
+#   CERT_PINS_FILE      – path to the single-source certificate pin file
+#                         (default: <repo>/shared/cert-pins.json).  Its
+#                         "release_signing_sha256" value is always checked against the
+#                         hosted assetlinks.json, so local runs and CI agree with the
+#                         same source of truth used by SignatureVerifier.EXPECTED_CERT_SHA256.
 #
 # Exit codes:
 #   0 – all checks passed
 #   1 – one or more checks failed (details printed to stderr)
 #
-# Cross-reference: #63 (iOS AASA check), #94 (this check).
+# Cross-reference: #63 (iOS AASA check), #94 (this check), #595 (single-source fingerprint).
 # If #63's fetch helper is ever extracted into a shared script, consider reusing it here
 # rather than duplicating the curl invocation.
 
@@ -38,6 +43,11 @@ APP_PACKAGE="${APP_PACKAGE:-com.ethosprotocol}"
 # disables fingerprint verification so the script is usable without secrets during development,
 # while still catching "file gone / wrong package" regressions.
 CERT_FINGERPRINTS="${CERT_FINGERPRINTS:-}"
+# Single source of truth for the release signing certificate fingerprint.  The same value
+# backs assetlinks.json, SignatureVerifier.EXPECTED_CERT_SHA256 and the Play App Signing
+# comparison in CI, so a re-signed release cannot silently break App Links.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CERT_PINS_FILE="${CERT_PINS_FILE:-$SCRIPT_DIR/../shared/cert-pins.json}"
 
 FAIL=0
 
@@ -174,6 +184,43 @@ PY
         echo "OK: at least one expected certificate fingerprint found"
     else
         echo "ERROR: none of the expected certificate fingerprints found in assetlinks.json" >&2
+        FAIL=1
+    fi
+fi
+
+# ── 7. Shared cert-pins.json fingerprint check ────────────────────────────────
+# The release signing fingerprint is single-sourced in shared/cert-pins.json.  Verify the
+# hosted assetlinks.json advertises exactly that fingerprint so the file, the verifier
+# constant and the Play App Signing certificate cannot drift apart unnoticed.
+if [[ ! -f "$CERT_PINS_FILE" ]]; then
+    echo "ERROR: cert pins file not found: $CERT_PINS_FILE" >&2
+    FAIL=1
+else
+    if python3 - "$APP_PACKAGE" "$CERT_PINS_FILE" <<'PY'
+import json, sys
+pkg = sys.argv[1]
+with open(sys.argv[2]) as fh:
+    pins = json.load(fh)
+expected = (pins.get("release_signing_sha256") or "").strip().upper()
+if not expected:
+    print(f"ERROR: release_signing_sha256 missing/empty in {sys.argv[2]}", file=sys.stderr)
+    sys.exit(2)
+data = json.load(open("/tmp/assetlinks.json"))
+found_fps = set(
+    fp.upper()
+    for entry in data
+    if entry.get("target", {}).get("package_name") == pkg
+    for fp in entry.get("target", {}).get("sha256_cert_fingerprints", [])
+)
+if expected not in found_fps:
+    print(f"Expected (cert-pins.json): {expected}", file=sys.stderr)
+    print(f"Found in assetlinks.json: {sorted(found_fps)}", file=sys.stderr)
+    sys.exit(1)
+PY
+    then
+        echo "OK: assetlinks.json matches shared/cert-pins.json release_signing_sha256"
+    else
+        echo "ERROR: assetlinks.json does not match shared/cert-pins.json release_signing_sha256" >&2
         FAIL=1
     fi
 fi

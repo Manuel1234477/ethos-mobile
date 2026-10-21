@@ -26,6 +26,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import plistlib
 import sys
 from datetime import datetime, timedelta, timezone
@@ -35,6 +36,7 @@ PINS_KEY = "TLS_PUBLIC_KEY_PINS"
 ENFORCED_CONFIGURATION = "release"
 DEFAULT_EXPIRY_WARNING_DAYS = 60
 DEFAULT_EXPIRY_FAIL_DAYS = 14
+DEFAULT_SHARED_PINS_PATH = "shared/cert-pins.json"
 
 
 def parse_target(raw: str) -> tuple[str, str]:
@@ -45,7 +47,41 @@ def parse_target(raw: str) -> tuple[str, str]:
     return name, path
 
 
-def check_target(name: str, plist_path: str) -> str | None:
+def load_shared_pins(shared_pins_path: str) -> tuple[list[str] | None, str | None]:
+    """Loads the single-source pin set from shared/cert-pins.json.
+
+    Returns (pins, error). `pins` is None when the file could not be read or
+    parsed; `error` is a failure message in that case.
+    """
+    path = Path(shared_pins_path)
+    if not path.is_file():
+        return None, f"Shared pin set not found at {shared_pins_path}"
+
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as exc:  # json raises several exception types
+        return None, f"Could not parse {shared_pins_path} as JSON ({exc})"
+
+    pins = data.get("pins") if isinstance(data, dict) else None
+    if not isinstance(pins, list) or not pins:
+        return None, (
+            f"{shared_pins_path} must contain a non-empty 'pins' array of "
+            f"Base64-encoded SPKI SHA-256 hashes."
+        )
+    if not all(isinstance(p, str) and p for p in pins):
+        return None, (
+            f"{shared_pins_path} 'pins' entries must be non-empty strings "
+            f"(Base64-encoded SPKI SHA-256 hashes)."
+        )
+    return list(pins), None
+
+
+def check_target(
+    name: str,
+    plist_path: str,
+    shared_pins: list[str] | None = None,
+) -> str | None:
     """Returns a failure message for `name`, or None if its pins are configured."""
     path = Path(plist_path)
     if not path.is_file():
@@ -80,6 +116,17 @@ def check_target(name: str, plist_path: str) -> str | None:
             f"TLS_PUBLIC_KEY_PIN_BACKUP for this configuration, or certificate pinning is "
             f"silently disabled for this target."
         )
+    if shared_pins is not None:
+        # The plist's entries are build-setting placeholders; compare the
+        # resolved values (the shared pin set) against the single source of
+        # truth so a rotation that only updates one platform fails CI.
+        resolved = [p for p in pins if not p.strip().startswith(("$(", "${"))]
+        if resolved != shared_pins:
+            return (
+                f"{name}: {PINS_KEY} in {plist_path} does not match the shared pin set "
+                f"({', '.join(resolved)} != {', '.join(shared_pins)}). Regenerate the "
+                f"platform inputs from shared/cert-pins.json."
+            )
     return None
 
 
@@ -155,6 +202,7 @@ def run(
     certificate_expiry: str | None = None,
     expiry_warning_days: int = DEFAULT_EXPIRY_WARNING_DAYS,
     expiry_fail_days: int = DEFAULT_EXPIRY_FAIL_DAYS,
+    shared_pins_path: str = DEFAULT_SHARED_PINS_PATH,
 ) -> int:
     if configuration.strip().lower() != ENFORCED_CONFIGURATION:
         print(
@@ -164,7 +212,17 @@ def run(
         )
         return 0
 
-    failures = [msg for name, path in targets for msg in [check_target(name, path)] if msg]
+    shared_pins, shared_pins_error = load_shared_pins(shared_pins_path)
+    if shared_pins_error:
+        print(f"::error::{shared_pins_error}")
+        return 1
+
+    failures = [
+        msg
+        for name, path in targets
+        for msg in [check_target(name, path, shared_pins)]
+        if msg
+    ]
 
     expiry_code, expiry_message = check_certificate_expiry(
         certificate_expiry,
@@ -223,6 +281,12 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_EXPIRY_FAIL_DAYS,
         help="Fail the build when the certificate has fewer than this many days remaining.",
     )
+    parser.add_argument(
+        "--shared-pins",
+        default=DEFAULT_SHARED_PINS_PATH,
+        help="Path to the single-source pin set (shared/cert-pins.json) that the "
+             "generated platform inputs must match.",
+    )
     args = parser.parse_args(argv)
     return run(
         args.configuration,
@@ -230,6 +294,7 @@ def main(argv: list[str] | None = None) -> int:
         certificate_expiry=args.certificate_expiry,
         expiry_warning_days=args.expiry_warning_days,
         expiry_fail_days=args.expiry_fail_days,
+        shared_pins_path=args.shared_pins,
     )
 
 
