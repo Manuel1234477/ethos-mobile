@@ -67,7 +67,7 @@
                 <data
                     android:scheme="https"
                     android:host="ethos-protocol.app"
-                    android:pathPrefix="/accept" />
+                    android:path="/accept" />
             </intent-filter>
 
             <!-- Deep link: ethosprotocol://vault/{vault_id}/{action} (#964) -->
