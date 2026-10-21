@@ -481,7 +481,17 @@ final class VaultStore: ObservableObject {
             // returns, mirroring Android's VaultViewModel.checkIn → PendingCheckInDao
             // + CheckInSyncWorker pattern.
             let item = PendingCheckIn(vaultId: vault.id, queuedAt: Date(), idempotencyKey: idempotencyKey)
-            PendingCheckInStore.shared.insert(item)
+            do {
+                // A check-in is the most time-sensitive action the app queues, so a failed
+                // write must not be swallowed (#615): surface it as a blocking alert rather
+                // than letting the user believe the check-in is safely queued.
+                try PendingCheckInStore.shared.insert(item)
+            } catch {
+                ifNotCancelled {
+                    self.error = ErrorPresentation(message: "Offline — your check-in could not be saved and was not queued. Please try again.")
+                }
+                return
+            }
             let count = PendingCheckInStore.shared.count
             NotificationService.shared.showQueuedCheckIn(count: count)
             CheckInSyncTask.shared.scheduleSync()
